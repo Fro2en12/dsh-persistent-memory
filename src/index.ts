@@ -19,7 +19,7 @@ import z from '@deepseek-ai/schemastery'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 
 export const name = '@dsh-external/dsh-persistent-memory'
-export const inject = ['tools', 'commands']
+export const inject = ['tools', 'commands', 'settings']
 
 export interface Config {
   /** 记忆库目录；缺省为 $DSH_HOME/dsh-persistent-memory */
@@ -1574,39 +1574,43 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  // settings 面板（v0.1.9）：DSH 设置页提供本插件开关卡片（缺 settings 服务时静默跳过）
-  ctx.inject(['settings'], (scopedCtx) => {
-    const scoped = scopedCtx as { settings?: { register: (ns: string, schema: unknown, opts: { base: Record<string, unknown> }) => { get: () => Record<string, unknown>; watch: (fn: () => void) => void } } }
-    if (!scoped.settings) return
-    const entry: Record<string, unknown> = {
+  // settings 面板（v0.1.10）：官方契约——inject 声明 'settings' 强制依赖，apply 内直接 register。
+  // register 挂插件 fiber、describe() 供配置 UI 渲染；结果写文件日志便于诊断（不依赖 web 日志重定向）。
+  const panelLogFile = join(dataDir, 'settings-panel.log')
+  const panelLog = (msg: string) => {
+    void fs.appendFile(panelLogFile, `[${new Date().toISOString()}] ${msg}\n`).catch(() => { /* 日志失败不影响插件 */ })
+  }
+  try {
+    const settingsEntry: Record<string, boolean> = {
       autoRecall, autoCapture, autoRecallRerank, rrfRecall, approveOnSet,
     }
-    let source = () => entry
-    const applyPanel = () => {
-      const v = source()
+    const settingsSvc = ctx as unknown as {
+      settings: {
+        register: (ns: string, schema: unknown, opts: { base?: Record<string, unknown>; applies?: string }) => {
+          get: () => Record<string, unknown>
+          watch: (fn: (next: Record<string, unknown>) => void) => void
+        }
+      }
+    }
+    const scope = settingsSvc.settings.register('dsh-persistent-memory', z.object({
+      autoRecall: z.boolean().default(true),
+      autoCapture: z.boolean().default(true),
+      autoRecallRerank: z.boolean().default(true),
+      rrfRecall: z.boolean().default(true),
+      approveOnSet: z.boolean().default(false),
+    }), { base: settingsEntry, applies: 'live' })
+    const applyPanel = (next?: Record<string, unknown>) => {
+      const v = next ?? scope.get()
       config.autoRecall = Boolean(v.autoRecall)
       config.autoCapture = Boolean(v.autoCapture)
       config.autoRecallRerank = Boolean(v.autoRecallRerank)
       config.rrfRecall = Boolean(v.rrfRecall)
       config.approveOnSet = Boolean(v.approveOnSet)
     }
-    try {
-      const scope = scoped.settings.register('dsh-persistent-memory', z.object({
-        autoRecall: z.boolean().default(true),
-        autoCapture: z.boolean().default(true),
-        autoRecallRerank: z.boolean().default(true),
-        rrfRecall: z.boolean().default(true),
-        approveOnSet: z.boolean().default(false),
-      }), { base: entry })
-      source = () => scope.get() as Record<string, unknown>
-      scopedCtx.effect(() => () => {
-        source = () => entry
-        applyPanel()
-      })
-      scope.watch(applyPanel)
-      applyPanel()
-    } catch (err) {
-      ctx.logger.warn('dsh-persistent-memory: settings panel unavailable: %o', err)
-    }
-  })
+    scope.watch((next) => applyPanel(next))
+    applyPanel()
+    panelLog('settings panel registered: ns=dsh-persistent-memory fields=5 applies=live')
+  } catch (err) {
+    panelLog('settings panel register FAILED: ' + String(err instanceof Error ? (err.stack || err.message) : err))
+  }
 }
