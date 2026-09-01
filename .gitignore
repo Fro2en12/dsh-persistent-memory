@@ -1,0 +1,13 @@
+node_modules/
+lib/
+*.tsbuildinfo
+*.tgz
+# 衍生与本地文件：市场目录快照、Claude Code 泄露源码副本、生成的记忆面板
+market-plugins.json
+reference-claude-memdir/
+memory-panel-*.html
+*.bak-*
+# 内部施工/交接文件（含本机路径与项目代号，不进公开仓库）
+CONSTRUCTION-GUIDE.md
+IMPLEMENTATION-1234.md
+scripts/cleanup-20260901.mjs
