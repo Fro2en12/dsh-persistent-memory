@@ -18,7 +18,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 
 这个插件不是凭空设计的，主要受三处来源影响：
 
-**1. Claude Code 官方记忆系统（memdir）** —— 核心机制的对标对象，依据是其官方文档与公开的 `claude-code-sourcemap` 仓库（v2.1.88 快照）：
+**1. Claude Code 官方记忆系统（memdir）** —— 核心机制的对标对象，依据其官方文档公开的机制描述：
 
 - `findRelevantMemories`（sideQuery 选择器）→ 本插件的 LLM 语义重排；
 - `memoryAge`（天龄 + 漂移警告）→ 本插件的新鲜度标注；
@@ -41,6 +41,8 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 - `dsh-email`：设置页面板三件套（`settings.section` slot + `exports ./client` + host 侧 `webServer` 路由）；
 - `dsh-market`：`settings.register` 命名空间注册模式；
 - DSH 官方 `docs/subsystems/settings.md`、`api-catalog` 与 dsh-plugin-guide 知识库：插件契约与接缝规范。
+
+> **许可说明**：上表所列社区仓库均持开源许可（`dsh-evolve` / `dsh-mneme` / `dsh-memory-porter` / `dsh-noema` / `dsh-native-memory` / `dsh-negative-ledger` / `dsh-memory-manager` 为 MIT；`dsh-memento` / `MisakaNet` / `dsh-butler-memory` 为 Apache-2.0；DSH 本体为 MIT）。本插件的实现为独立原创，仅对标上述项目的设计思路与行为，未复制或引用任何第三方源码。
 
 ## 功能特性
 
