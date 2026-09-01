@@ -42,8 +42,6 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 - `dsh-market`：`settings.register` 命名空间注册模式；
 - DSH 官方 `docs/subsystems/settings.md`、`api-catalog` 与 dsh-plugin-guide 知识库：插件契约与接缝规范。
 
-> **许可说明**：上表所列社区仓库均持开源许可（`dsh-evolve` / `dsh-mneme` / `dsh-memory-porter` / `dsh-noema` / `dsh-native-memory` / `dsh-negative-ledger` / `dsh-memory-manager` 为 MIT；`dsh-memento` / `MisakaNet` / `dsh-butler-memory` 为 Apache-2.0；DSH 本体为 MIT）。本插件的实现为独立原创，仅对标上述项目的设计思路与行为，未复制或引用任何第三方源码。
-
 ## 功能特性
 
 | 机制 | 说明 |
