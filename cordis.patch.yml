@@ -1,0 +1,5 @@
+# dsh-persistent-memory bundle patch
+# 供 `dsh plugin --profile web add <路径>` 自动挂载（Loader bundle 层）。
+- insert:
+    - id: dsh-persistent-memory
+      name: '@dsh-external/dsh-persistent-memory'
