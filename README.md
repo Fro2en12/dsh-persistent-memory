@@ -14,6 +14,34 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 - 欢迎提交 Issue / Pull Request 修正问题或扩展能力；
 - 本项目基于 BSD-3-Clause 协议开源，可自由使用、修改与分发。
 
+## 设计与对标来源
+
+这个插件不是凭空设计的，主要受三处来源影响：
+
+**1. Claude Code 官方记忆系统（memdir）** —— 核心机制的对标对象，依据是其官方文档与公开的 `claude-code-sourcemap` 仓库（v2.1.88 快照）：
+
+- `findRelevantMemories`（sideQuery 选择器）→ 本插件的 LLM 语义重排；
+- `memoryAge`（天龄 + 漂移警告）→ 本插件的新鲜度标注；
+- `MEMORY.md`（索引与主题文件分离）→ 本插件的记忆索引兜底；
+- 记忆类型学（user / feedback / project / reference）→ 本插件的九类分类学；
+- 写侧规则（不记重复、矛盾时显式标注覆盖、plan/tasks 优先于 memory、敏感数据禁令）→ 本插件的守则判据。
+
+**2. DSH 插件市场 135 个记忆类插件** —— 功能补齐的对标池（依据 awesome-dsh-plugin.com 市场目录，2821 个插件）：
+
+- `dsh-evolve`：零 token RRF 混合召回、中文分词、重复观察强化 → 本插件的 RRF 混合召回；
+- `dsh-mneme`：热度遗忘巩固 + 周期维护 → 本插件的记忆代谢（`memory_dream`）；
+- `dsh-memory-porter` / `dsh-noema`：Claude / 多工具记忆导入 → 本插件的 `memory_import`；
+- `dsh-native-memory`：`(sessionId, seq)` 来源引证 → 本插件的 source 引证；
+- `dsh-memento`：写入审批门 → 本插件的 `approveOnSet`；
+- `dsh-negative-ledger` / `MisakaNet`：负面知识账本 → 本插件的 lesson.* 分类；
+- `dsh-butler-memory` / `dsh-memory-manager`：Web 治理面板 → 本插件的设置页面板与 `/memory panel`。
+
+**3. DSH 自身生态与官方接缝** —— 决定实现方式：
+
+- `dsh-email`：设置页面板三件套（`settings.section` slot + `exports ./client` + host 侧 `webServer` 路由）；
+- `dsh-market`：`settings.register` 命名空间注册模式；
+- DSH 官方 `docs/subsystems/settings.md`、`api-catalog` 与 dsh-plugin-guide 知识库：插件契约与接缝规范。
+
 ## 功能特性
 
 | 机制 | 说明 |
