@@ -101,7 +101,7 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
 
 ```
 lib/index.js    Host 半部分（ESM；inject tools/commands/settings，webServer 惰性）
-  ├─ Config（schemastery）      16 个可调参数、加载期校验
+  ├─ Config（schemastery）      17 个可调参数、加载期校验
   ├─ 写侧闸门                   前缀白名单 / ≤160 字 / tags ≤3 / 凭据检测 / 冲突警告
   ├─ pre-step 管线              守则 → 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底
   ├─ RRF 混合召回               bigram-Jaccard 中文二元组 + 词法双排名倒数融合（K=60）
