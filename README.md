@@ -173,8 +173,6 @@ node --check lib/index.js               # host 语法检查
 node --check lib/client.js              # client 语法检查
 ```
 
-**部署前三步验证**（本项目铁律）：① tsc 零错误；② package.json 每个 exports 路径的文件在产物里存在；③ 3081 临时实例预演（`bin.js --profile web --port 3081 --no-open`）确认加载成功、无崩溃日志——全部通过才替换 vendor、改依赖、重启 3080。
-
 ## License
 
 BSD-3-Clause
