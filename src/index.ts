@@ -1070,7 +1070,7 @@ export function apply(ctx: Context, config: Config): void {
           created = true
         }
         await writeItems(items)
-        return { ok: true, key, scope, created, mergedKey, updatedAt: now, warnings: warnings.length ? warnings : undefined }
+        return { ok: true, key, scope, created, mergedKey, updatedAt: now, ...(warnings.length ? { warnings } : {}) }
       })
     },
   })), '@dsh-external/dsh-persistent-memory: memory_set')

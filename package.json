@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-persistent-memory",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "DSH 持久记忆插件：跨会话保存/检索用户偏好、项目事实与任务状态，数据落盘 JSONL。",
   "private": true,
   "type": "module",
