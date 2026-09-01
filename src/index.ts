@@ -1613,4 +1613,89 @@ export function apply(ctx: Context, config: Config): void {
   } catch (err) {
     panelLog('settings panel register FAILED: ' + String(err instanceof Error ? (err.stack || err.message) : err))
   }
+
+  // settings 面板后端路由（v0.1.13）：浏览器组件经同源 fetch 读写本命名空间
+  // 模式照 dsh-email：webServer 可选服务 + exact 路由 + localhost-only 访问
+  ctx.inject(['webServer'], (webCtx) => {
+    const wctx = webCtx as unknown as {
+      webServer: { register: (opts: { kind: string; path: string; handler: (req: unknown, res: unknown) => void }) => () => void }
+      effect: (fn: () => (() => void) | void, name?: string) => void
+    }
+    wctx.effect(() => {
+      const NS = 'dsh-persistent-memory'
+      const ROUTE = '/_dsh/dsh-persistent-memory/settings'
+      const svc = ctx as unknown as {
+        settings: {
+          describe: () => { ns: string; revision?: number; applies?: string }[]
+          get: (ns: string) => unknown
+          replace: (ns: string, section: unknown, expectedRevision?: number) => Promise<void>
+          writable?: boolean
+        }
+      }
+      const respond = (res: { setHeader: (a: string, b: string) => void; writeHead: (n: number) => void; end: (d: unknown) => void }, status: number, body: unknown) => {
+        const bytes = Buffer.from(JSON.stringify(body))
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Content-Length', String(bytes.length))
+        res.setHeader('Cache-Control', 'no-store')
+        res.writeHead(status)
+        res.end(bytes)
+      }
+      const handler = async (req: { method?: string; socket?: { remoteAddress?: string } }, res: unknown) => {
+        const rr = res as { setHeader: (a: string, b: string) => void; writeHead: (n: number) => void; end: (d: unknown) => void }
+        const remote = String(req.socket?.remoteAddress ?? '')
+        if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+          respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'dsh-persistent-memory settings route is localhost-only' } })
+          return
+        }
+        if (req.method === 'GET') {
+          try {
+            const descriptor = svc.settings.describe().find((row) => row.ns === NS)
+            respond(rr, 200, {
+              ok: true,
+              value: {
+                settings: { value: svc.settings.get(NS), revision: descriptor?.revision ?? 0, applies: descriptor?.applies ?? 'live' },
+                writable: svc.settings.writable !== false,
+              },
+            })
+          } catch (err) {
+            respond(rr, 503, { ok: false, error: { code: 'unavailable', message: String(err) } })
+          }
+          return
+        }
+        if (req.method !== 'POST') {
+          rr.setHeader('Allow', 'GET, POST')
+          respond(rr, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
+          return
+        }
+        let body: { action?: string; value?: unknown; expectedRevision?: number }
+        try {
+          const chunks: Buffer[] = []
+          for await (const chunk of req as unknown as AsyncIterable<Buffer | string>) {
+            const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            if (chunks.reduce((n, c) => n + c.length, 0) + part.length > 256 * 1024) throw new RangeError('request body too large')
+            chunks.push(part)
+          }
+          body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        } catch (err) {
+          respond(rr, 400, { ok: false, error: { code: 'invalid-request', message: String(err) } })
+          return
+        }
+        try {
+          if (body?.action === 'save') {
+            if (!Number.isSafeInteger(body.expectedRevision)) throw new Error('expectedRevision must be a non-negative integer')
+            await svc.settings.replace(NS, body.value, body.expectedRevision)
+            const descriptor = svc.settings.describe().find((row) => row.ns === NS)
+            respond(rr, 200, { ok: true, value: { settings: { value: svc.settings.get(NS), revision: descriptor?.revision ?? 0, applies: descriptor?.applies ?? 'live' } } })
+          } else {
+            respond(rr, 400, { ok: false, error: { code: 'invalid-request', message: 'unsupported action' } })
+          }
+        } catch (err) {
+          const conflict = (err as { code?: string })?.code === 'SETTINGS_CONFLICT'
+          respond(rr, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'settings-conflict' : 'rejected', message: String(err) } })
+        }
+      }
+      const dispose = wctx.webServer.register({ kind: 'exact', path: ROUTE, handler: handler as unknown as (req: unknown, res: unknown) => void })
+      return dispose
+    }, 'dsh-persistent-memory: settings route')
+  })
 }
