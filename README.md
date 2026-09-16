@@ -47,16 +47,21 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 | 机制 | 说明 |
 |---|---|
 | 九类记忆分类学 | 每会话首轮注入「自动记忆守则」：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
-| 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤160 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
+| 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
 | LLM 语义重排 | 候选 ≥2 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
-| 教训通道 | 悔恨信号（「又错/还是失败」）或场景信号（路径/盘符/终端/命令）时**不受每会话一次限制**强制召回 rule.*/lesson.*，独立 120s 冷却——错误发生时把上次的坑摆到眼前 |
-| 记忆索引兜底 | 首轮 0 召回时注入动态【记忆索引】（global 4 条：user.* 画像固定 2 席 + 其余最新 2 席；工作区 scope 各 3 条），不落盘 |
+| 教训通道 | 悔恨信号（「又错/还是失败」）或场景信号（路径/盘符/终端/命令）时**不受每会话一次限制**强制召回 rule.*/lesson.*，独立 120s 冷却——错误发生时把上次的坑摆到眼前。同一条在本会话历史里出现过就不再注入（v0.1.20 修 marker 格式，此前去重形同虚设） |
+| 记忆索引兜底 | 首轮 0 召回时注入动态【记忆索引】，**只列 key 不列摘要**（global 4 个：user.* 画像固定 2 席 + 其余最新 2 席；工作区 scope 各 3 个；v0.1.20 实测 424 → 约 160 字），不落盘；索引注入后本会话不再补召回，避免两套重叠（v0.1.20） |
 | 新鲜度标注 | 每条召回显示天龄（今天/昨天/N 天前）；>1 天附漂移警告——时点观察，点名文件/路径引用前先验证现状 |
 | 来源引证 | `memory_set` 自动填「日期+会话 id」，召回行展示 `· 自2026-09-01 s=xxx` |
 | 子代理隔离 | 子代理会话注入只读守则 + `memory_set` 硬层拒绝写 global（提示 `scope=sub:<id>`）；成果回传父会话沉淀 |
 | 记忆代谢 | `memory_dream` 工具 + `/memory dream`：task 超 30 天 / 任意超 90 天 / 标记完成超 14 天出候选，由模型决定更新/归档/删除 |
+| 注入预算 | 条数上限（`autoRecallLimit`，默认 2）之外再加字符预算（`autoRecallBudgetChars`，v0.1.20 起默认 300，原 600）：超出按分数顺序截断——单条成本约 200 字，300 的预算实际多为 1 条、偶尔 2 条；漂移警告合并为一段而非每条一段（v0.1.16） |
+| 召回阈值 | 绝对下限 + 相对比例组合（v0.1.17）：`autoRecallMinScore`（默认 3）挡住"整体都不相关"；`autoRecallRelativeFloor`（默认 0.5）只留与最高分同量级的，挡住"矮子里拔将军" |
+| 补位收口 | `rrfFirstTurnOnly`（默认 true，v0.1.18）：RRF 语义补位只在首轮兜底；非首轮词法被阈值过滤即整体不相关，注入 0 条而非用另一通道放回排名靠前的记忆 |
+| 注入去重 | 会话注入状态落盘 `session-injections.json`（v0.1.19，30 天 TTL）+ form 级去重（不再比对正文）：内存 Map 重启即失效会让同一会话每重启一次重复注入一份守则/召回（实测 5 次 = 8722 字） |
 | 记忆导入 | `memory_import` + `/memory import`：CLAUDE.md / MEMORY.md / Claude Code memories.json，自动分 ref/rule/lesson 前缀，与库中 ≥70% 相似自动跳过 |
+| 凭据隔离 | `auth.*` 不参与任何自动注入通道（召回/教训/索引，v0.1.20）：实测 `[global/auth.platforms]` 会把明文密码带进每个新会话的上下文；凭据只在模型显式 `memory_search` / `memory_get` 时返回 |
 | 会话回捞 | `memory_recall`：走 `ctx.get('sessionQuery')` 全文检索历史会话，记忆没记但以前说过的事能捞回来 |
 | 内容冲突检测 | 写入时对同 scope 条目算内容相似度，≥55% 警告「确认是否应更新该条而非新建」 |
 | 治理面板 | 设置页「记忆」分区 5 个开关（自动回忆/自动捕获/回忆重排/RRF 召回/写入审批）即时生效；`/memory panel` 生成自包含 HTML 浏览/搜索（auth.* 凭据排除） |
@@ -104,10 +109,16 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
       name: '@dsh-external/dsh-persistent-memory'
       config:
         autoRecall: true            # 每轮自动召回注入
-        autoRecallLimit: 3          # 召回最多注入条数
+        autoRecallLimit: 2          # 召回最多注入条数
         autoRecallRerank: true      # LLM 语义重排
         rrfRecall: true             # RRF 混合召回（词法 0 命中语义补位）
+        rrfFirstTurnOnly: true      # 补位只在首轮（非首轮词法被阈值过滤 = 整体不相关，宁可不注入）
         autoCapture: true           # 每会话注入记忆守则
+        autoCaptureDetail: brief    # 守则详略：brief（默认，约 210 字）| full（完整九类细则约 1300 字）
+        autoRecallBudgetChars: 300  # 单次召回注入字符预算（默认 300 ≈ 1 条），超出按分数截断
+        autoRecallMinScore: 3       # 非首轮召回的绝对分数下限（原 1 过松，会注入无关记忆）
+        autoRecallRelativeFloor: 0.5 # 相对阈值：低于最高分该比例的记忆不注入；0 禁用
+        taskTtlDays: 30             # task.* 保鲜期，超期在召回评分中降权
         approveOnSet: false         # 写入审批门（开启后须用户确认）
         dedupeOnSet: true           # 同 scope 高相似 key 自动合并
         synonymExpansion: true      # 同义词扩展评分

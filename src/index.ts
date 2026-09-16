@@ -10,7 +10,7 @@
  *
  * 规范：资源注册必须挂 ctx.effect / ctx.on（热重载/卸载自动清理）。
  */
-import { promises as fs } from 'node:fs'
+import { existsSync, promises as fs, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { Context } from 'cordis'
@@ -34,12 +34,20 @@ export interface Config {
   autoRecallLimit?: number
   /** 自动召回每条 value 最大展示字符数 */
   autoRecallMaxChars?: number
+  /** 单次召回注入的字符预算（默认 600）：超出按分数顺序截断，防止一次塞太多 */
+  autoRecallBudgetChars?: number
+  /** 非首轮召回的绝对分数下限（默认 3；v0.1.17 前为 1，过松导致无关记忆被注入） */
+  autoRecallMinScore?: number
+  /** 相对阈值（默认 0.5）：低于最高分该比例的记忆不注入；0 表示禁用 */
+  autoRecallRelativeFloor?: number
   /** 自动召回限定作用域；空串表示不限定 */
   autoRecallScope?: string
   /** 没有相关匹配时是否回退注入最近记忆（默认 false，避免无关上下文污染） */
   autoRecallFallback?: boolean
   /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
   autoCapture?: boolean
+  /** 守则详略：brief（默认，精简版约 400 字）| full（完整九类细则） */
+  autoCaptureDetail?: 'brief' | 'full'
   /** 每个会话只自动注入一次记忆；冷却期内不重复注入（默认 true） */
   autoRecallOnce?: boolean
   /** 自动注入冷却毫秒数；同一会话在该窗口内不重复注入（默认 10 分钟） */
@@ -52,10 +60,16 @@ export interface Config {
   autoRecallRerank?: boolean
   /** 语义重排时 LLM 可选的记忆条数上限 */
   autoRecallRerankMax?: number
-  /** 启用 RRF 混合召回（词法+中文二元组双排名融合），词法 0 命中时按语义补位（默认 true） */
+  /** 写入 RRF 混合召回（词法+中文二元组双排名融合），词法 0 命中时按语义补位（默认 true） */
   rrfRecall?: boolean
+  /** RRF 语义补位是否只在首轮生效（默认 true）：非首轮词法被阈值过滤 = 整体不相关，宁可不注入 */
+  rrfFirstTurnOnly?: boolean
   /** 写入前需用户确认：开启后 memory_set 必须带 confirmed=true 才落盘（默认 false） */
   approveOnSet?: boolean
+  /** value 摘要存储上限（默认 240）：超长自动句边界截断，完整原文归档进 full，不拒绝写入 */
+  valueMaxChars?: number
+  /** task.* 保鲜期（天，默认 30）：超期在召回评分中降权，避免过时任务状态被当成现状 */
+  taskTtlDays?: number
 }
 
 export const Config = z.object({
@@ -63,11 +77,15 @@ export const Config = z.object({
   defaultScope: z.string().default('global'),
   maxResults: z.number().default(20),
   autoRecall: z.boolean().default(true),
-  autoRecallLimit: z.number().default(3),
+  autoRecallLimit: z.number().default(2),
   autoRecallMaxChars: z.number().default(160),
+  autoRecallBudgetChars: z.number().default(300),
+  autoRecallMinScore: z.number().default(3),
+  autoRecallRelativeFloor: z.number().default(0.5),
   autoRecallScope: z.string().default(''),
   autoRecallFallback: z.boolean().default(false),
   autoCapture: z.boolean().default(true),
+  autoCaptureDetail: z.string().default('brief'),
   autoRecallOnce: z.boolean().default(true),
   autoRecallCooldownMs: z.number().default(10 * 60 * 1000),
   synonymExpansion: z.boolean().default(true),
@@ -75,7 +93,10 @@ export const Config = z.object({
   autoRecallRerank: z.boolean().default(true),
   autoRecallRerankMax: z.number().default(5),
   rrfRecall: z.boolean().default(true),
+  rrfFirstTurnOnly: z.boolean().default(true),
   approveOnSet: z.boolean().default(false),
+  valueMaxChars: z.number().default(240),
+  taskTtlDays: z.number().default(30),
 })
 
 interface MemoryItem {
@@ -102,19 +123,39 @@ export function apply(ctx: Context, config: Config): void {
   const defaultScope = config.defaultScope || 'global'
   const maxResults = Math.max(1, config.maxResults || 20)
   const autoRecall = config.autoRecall !== false
-  const autoRecallLimit = Math.max(1, Math.min(20, config.autoRecallLimit || 3))
+  const autoRecallLimit = Math.max(1, Math.min(20, config.autoRecallLimit || 2))
   const autoRecallMaxChars = Math.max(40, config.autoRecallMaxChars || 160)
+  // 注入预算（v0.1.16，对标 mem0 的 top_k + Letta 的 memory block 字符上限）：
+  // 条数上限管不住"每条都很长"的情况，字符预算才能给出可预测的上下文开销。
+  // v0.1.20：600 → 300。单条成本 ≈ 截断后正文 + key + 固定包装 ≈ 200 字，
+  // 300 的预算意味着实际多为 1 条、偶尔 2 条——自动注入只负责"提个醒"，取全用 memory_search。
+  const autoRecallBudgetChars = Math.max(120, config.autoRecallBudgetChars || 300)
+  // 召回阈值（v0.1.17）：绝对下限挡"整体都不相关"，相对比例挡"矮子里拔将军"。
+  // 参考 mem0 的 threshold（归一化相似度绝对门槛）与 Zep 的 limit + reranker 两级做法。
+  const autoRecallMinScore = Math.max(0, config.autoRecallMinScore ?? 3)
+  const autoRecallRelativeFloor = Math.max(0, Math.min(1, config.autoRecallRelativeFloor ?? 0.5))
   const autoRecallScope = (config.autoRecallScope || '').trim()
   const autoRecallFallback = config.autoRecallFallback === true
   const autoCapture = config.autoCapture !== false
+  // 守则详略（v0.1.16）：默认 brief——完整守则约 1300 字且每会话常驻上下文，
+  // 细则在 memory_set 校验报错时按需返回，不必每会话全量注入。
+  const autoCaptureDetail: 'brief' | 'full' = config.autoCaptureDetail === 'full' ? 'full' : 'brief'
   const autoRecallOnce = config.autoRecallOnce !== false
   const autoRecallCooldownMs = Math.max(0, config.autoRecallCooldownMs ?? 10 * 60 * 1000)
   const rrfRecall = config.rrfRecall !== false
+  // 补位收口（v0.1.18）：非首轮词法被阈值过滤说明整体不相关，此时再语义补位等于
+  // 用另一条通道放回排名靠前的记忆（0.025 ≈ 综合前 20）。首轮保留兜底。
+  const rrfFirstTurnOnly = config.rrfFirstTurnOnly !== false
   const approveOnSet = config.approveOnSet === true
   const synonymExpansion = config.synonymExpansion !== false
   const dedupeOnSet = config.dedupeOnSet !== false
   const autoRecallRerank = config.autoRecallRerank !== false
+  // task.* 保鲜期（v0.1.16）：任务状态变化快，超期记忆在评分里降权而不是删除（保留可查）。
+  const taskTtlDays = Math.max(1, config.taskTtlDays || 30)
   const autoRecallRerankMax = Math.max(1, Math.min(8, config.autoRecallRerankMax || 5))
+  // value 存储上限（写侧，v0.1.15）：与注入展示上限 autoRecallMaxChars（160）分离——
+  // 展示截断只影响本次注入 token 预算；存储摘要上限决定"自足摘要能写多全"。
+  const valueMaxChars = Math.max(120, config.valueMaxChars || 240)
 
   // 串行化读写，避免并发写坏 JSONL
   let queue: Promise<unknown> = Promise.resolve()
@@ -217,8 +258,47 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // ── 改进支撑设施 ──────────────────────────────────────────────────────
-  // ① 会话级注入记录：sessionId → 上次注入时间戳（每会话一次 + 冷却期）
+  // ① 会话级注入记录：sessionId → 上次注入时间戳（每会话一次 + 冷却期）。
+  // v0.1.19 持久化到 dataDir/session-injections.json：内存 Map 重启即清空，
+  // 而注入是追加到会话历史的、无法撤回——实测同一会话重启 5 次就攒了 5 份守则
+  // 与 5 份召回（8722 字，本应 888 字）。落盘后"每会话一次"跨重启成立。
+  const injectionStateFile = join(dataDir, 'session-injections.json')
+  const INJECTION_STATE_TTL_MS = 30 * 86_400_000
   const sessionInjections = new Map<string, number>()
+
+  function loadInjectionState(): void {
+    try {
+      if (!existsSync(injectionStateFile)) return
+      const raw = JSON.parse(readFileSync(injectionStateFile, 'utf8')) as { entries?: Record<string, number> }
+      const now = Date.now()
+      for (const [key, ts] of Object.entries(raw?.entries ?? {})) {
+        if (typeof ts === 'number' && now - ts < INJECTION_STATE_TTL_MS) sessionInjections.set(key, ts)
+      }
+    } catch {
+      // 状态文件损坏/不可读：按空状态继续，最坏退回"每次重启重新注入"的旧行为
+    }
+  }
+
+  let persistTimer: ReturnType<typeof setTimeout> | null = null
+  function persistInjectionState(): void {
+    if (persistTimer) return
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      void (async () => {
+        try {
+          await fs.mkdir(dataDir, { recursive: true })
+          const entries: Record<string, number> = {}
+          for (const [key, ts] of sessionInjections) entries[key] = ts
+          await fs.writeFile(injectionStateFile, JSON.stringify({ version: 1, entries }), 'utf8')
+        } catch {
+          // 写失败只降低去重效果，不阻塞注入流程
+        }
+      })()
+    }, 500)
+    persistTimer.unref?.()
+  }
+
+  loadInjectionState()
 
   // ② 工作区感知：环境变量优先（harness 下 process.cwd() 是 host 进程目录，非当前工作区），cwd 仅兜底
   let workspaceScopesCache: string[] | null = null
@@ -313,7 +393,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // ④b 语义辅助（v0.1.9）：中文二元组 + 英文词元，零 token 零依赖
   function tokenizeForSemantic(s: string): string[] {
-    const cleaned = s.toLowerCase().replace(/s+/g, ' ')
+    const cleaned = s.toLowerCase().replace(/\s+/g, ' ')
     const tokens: string[] = []
     const cn = cleaned.match(/[一-鿿]+/g) || []
     for (const run of cn) {
@@ -332,6 +412,15 @@ export function apply(ctx: Context, config: Config): void {
     const setB = new Set(tb)
     const overlap = ta.filter((t) => setB.has(t)).length
     return overlap / (ta.length + tb.length - overlap)
+  }
+
+  // RRF 补位的语义交集门槛（v0.1.21）：查询与条目共享多少个中文二元组/英文词元。
+  // RRF 是相对排名，小记忆库里最坏排名也能过 0.025（库 ≤21 条时任何条目都过线），
+  // 只靠它补位 = 库里有货就塞满配额、与查询无关。补位必须真的沾边。
+  function semanticOverlap(query: string, text: string): number {
+    const q = tokenizeForSemantic(query)
+    const t = new Set(tokenizeForSemantic(text))
+    return q.filter((token) => t.has(token)).length
   }
 
   // RRF 倒数排名融合：词法分 + bigram 相似度双排名（对标 dsh-evolve 的零 token 混合召回）
@@ -441,6 +530,13 @@ export function apply(ctx: Context, config: Config): void {
     //    "犯同样错"的常见根因正是首轮不知道用户约定（如 pwsh 7、非 C 盘）→ 改为 +1
     if (key.startsWith('user.') && isFirstTurn) score += 1
 
+    // ⑦ task.* 保鲜期（v0.1.16）：任务状态变化快，超期记忆降权而非删除——
+    //    "30 天前的任务进展"几乎不可能是现状，但作为历史仍有查询价值。
+    if (key.startsWith('task.')) {
+      const ageDays = Math.floor((Date.now() - Date.parse(item.updatedAt)) / 86_400_000)
+      if (Number.isFinite(ageDays) && ageDays > taskTtlDays) score -= 3
+    }
+
     // 信号词扩展：仅在非首轮启用，避免首轮被大量无关记忆污染
     if (!isFirstTurn) {
       const SIGNAL_WORDS = [
@@ -481,6 +577,13 @@ export function apply(ctx: Context, config: Config): void {
       .some((w) => blob.includes(w))
   }
 
+  // 自动注入通道排除 auth.*（v0.1.20）：凭据类记忆只在模型显式 memory_search /
+  // memory_get 时返回，不随首轮自动注入进入每个新会话——实测 [global/auth.platforms]
+  // 会把两个账号的明文密码带进每次新会话的上下文，既费 token 也放大泄露面。
+  function excludeAuth(items: MemoryItem[]): MemoryItem[] {
+    return items.filter((item) => !item.key.toLowerCase().startsWith('auth.'))
+  }
+
   function pickLessonItems(items: MemoryItem[], isRegret: boolean, isRule: boolean, limit: number): MemoryItem[] {
     const candidates = items.filter((item) => isLessonLike(item))
     if (candidates.length === 0) return []
@@ -511,14 +614,28 @@ export function apply(ctx: Context, config: Config): void {
       if (b.score !== a.score) return b.score - a.score
       return b.item.updatedAt.localeCompare(a.item.updatedAt)
     })
-    // 首轮要求 score >= 6（一次 key 直中 + 少量辅助，防止弱词/同义把无关记忆抬上分）
-    const minScore = isFirstTurn ? 6 : 1
-    const top = scored.filter((entry) => entry.score >= minScore).map((entry) => entry.item)
+    // 阈值（v0.1.17）：绝对下限 + 相对比例组合。
+    // - 绝对下限挡住"整体都不相关"（所有候选分数都低时全部过滤，宁可不注入）；
+    // - 相对比例只留与最佳匹配同量级的，挡住"矮子里拔将军"（top1 自己也低时仍会被注入）。
+    // 首轮仍用固定 6（一次 key 直中 + 少量辅助，防止弱词/同义把无关记忆抬上分）。
+    const minScore = isFirstTurn ? 6 : autoRecallMinScore
+    const best = scored.length > 0 ? scored[0].score : 0
+    const relativeFloor = (!isFirstTurn && autoRecallRelativeFloor > 0 && best > 0)
+      ? best * autoRecallRelativeFloor
+      : 0
+    const floor = Math.max(minScore, relativeFloor)
+    const top = scored.filter((entry) => entry.score >= floor).map((entry) => entry.item)
     // 画像兜底已移除（v0.1.6）：首轮 0 命中改由 pre-step 的【记忆索引】块兜底，user.* 画像在其中自然呈现。
     if (top.length >= limit) return top.slice(0, limit)
     // v0.1.9 RRF 语义补位：词法 0 命中时，用词法+二元组双排名召回语义相关条目（零 token）
-    if (rrfRecall && top.length === 0 && query) {
-      const ranked = rrfRanking(scoped, query).filter((e) => e.rrf >= 0.025)
+    if (rrfRecall && (!rrfFirstTurnOnly || isFirstTurn) && top.length === 0 && query) {
+      // 补位也必须真的沾边：共享中文二元组/英文词元才算相关。
+      // 首轮更严（注入无关记忆的注意力代价最高），非首轮放宽到 1。
+      const minOverlap = isFirstTurn ? 2 : 1
+      const ranked = rrfRanking(scoped, query).filter((e) => {
+        if (e.rrf < 0.025) return false
+        return semanticOverlap(query, `${e.item.key} ${e.item.value}`) >= minOverlap
+      })
       if (ranked.length > 0) return ranked.slice(0, limit).map((e) => e.item)
     }
     // 首轮不启用 fallback，避免用"最近记忆"凑数
@@ -566,8 +683,34 @@ export function apply(ctx: Context, config: Config): void {
     return `\n> ⚠️ 记忆为 ${d} 天前的时点观察，可能已过时：记忆中点名的文件/路径/命令，引用前请先验证现状；与当前信息冲突时以现状为准，并更新该记忆。`
   }
 
+  // 合并漂移警告（v0.1.16）：每条记忆各附一段几乎相同的警告是纯冗余，
+  // 改为整块共用一段并取最老天数——信息量不变，字数降一个数量级。
+  function mergedDriftNote(items: MemoryItem[]): string {
+    const ages = items
+      .map((item) => Math.max(0, Math.floor((Date.now() - Date.parse(item.updatedAt)) / 86_400_000)))
+      .filter((d) => Number.isFinite(d) && d > 1)
+    if (ages.length === 0) return ''
+    const oldest = Math.max(...ages)
+    return `\n> ⚠️ 以上 ${ages.length} 条为 ${oldest} 天前的时点观察，可能已过时：点名的文件/路径/命令引用前先验证现状；与现状冲突时以现状为准，并更新该记忆。`
+  }
+
+  // 注入预算裁剪（v0.1.16）：条数上限管不住"每条都很长"，按分数顺序累计，
+  // 超出 autoRecallBudgetChars 的条目直接丢弃——宁少勿多，无关占位比留白更贵。
+  function fitBudget(items: MemoryItem[], budget: number): MemoryItem[] {
+    const kept: MemoryItem[] = []
+    let used = 0
+    for (const item of items) {
+      const cost = Math.min(sanitizeValue(item.value).length, autoRecallMaxChars) + item.key.length + 48
+      if (kept.length > 0 && used + cost > budget) break
+      kept.push(item)
+      used += cost
+    }
+    return kept
+  }
+
   function formatRecall(items: MemoryItem[], all: MemoryItem[]): string {
-    const lines = items.map((item) => {
+    const fitted = fitBudget(items, autoRecallBudgetChars)
+    const lines = fitted.map((item) => {
       // ⑤ 投毒防护：注入前清洗（控制字符/危险 URI scheme/提示注入模式）
       const cleaned = sanitizeValue(item.value)
       const value = truncate(cleaned, autoRecallMaxChars)
@@ -581,16 +724,17 @@ export function apply(ctx: Context, config: Config): void {
       }
       return line
     })
-    const note = items.reduce((acc, item) => acc + driftNote(item.updatedAt), '')
+    const note = mergedDriftNote(fitted)
     return `【记忆自动召回】\n${lines.join('\n')}${note}`
   }
 
   function formatLesson(items: MemoryItem[]): string {
-    const lines = items.map((item) => {
+    const fitted = fitBudget(items, autoRecallBudgetChars)
+    const lines = fitted.map((item) => {
       const cleaned = sanitizeValue(item.value)
       return `- [${item.scope}/${item.key} · ${ageLabel(item.updatedAt)}${item.source ? ` · 自${item.source}` : ''}] ${truncate(cleaned, autoRecallMaxChars)}`
     })
-    const note = items.reduce((acc, item) => acc + driftNote(item.updatedAt), '')
+    const note = mergedDriftNote(fitted)
     return `【历史教训/规则提醒】以下记忆与当前场景相关，请优先遵守以避免重复犯错：\n${lines.join('\n')}${note}`
   }
 
@@ -661,7 +805,9 @@ export function apply(ctx: Context, config: Config): void {
       const selected = (parsed.selected_keys ?? [])
         .map((k: string) => byKey.get(k))
         .filter((x: MemoryItem | undefined): x is MemoryItem => !!x)
-      return selected.length > 0 ? selected.slice(0, limit) : null
+      // 解析成功就如实返回（空数组 = LLM 明确否决，调用处据此回落索引兜底）；
+      // 只有异常/超时才是 null（降级回词法结果）。
+      return selected.slice(0, limit)
     } catch (err) {
       ctx.logger.warn('dsh-persistent-memory: rerank failed: %o', err)
       return null
@@ -671,7 +817,10 @@ export function apply(ctx: Context, config: Config): void {
   // ── 记忆索引（对标 Claude Code MEMORY.md，动态生成不落盘）──────────────
   // 触发：首轮 && 无信号 && !hasImage && 常规召回 0 命中 && 教训通道未注入。
   // 替代画像兜底（v0.1.7 起 user.* 在 global 组有固定 2 席配额，画像真实呈现）。
-  function buildIndexBlock(items: MemoryItem[]): string {
+  function buildIndexBlock(rawItems: MemoryItem[]): string {
+    // v0.1.20：只列 key 不列摘要（实测 424 → 约 160 字），并排除 auth.*——
+    // 目录里出现 [auth.platforms] 这类 key 本身就是不该随新会话扩散的线索。
+    const items = excludeAuth(rawItems)
     const scopes = new Map<string, MemoryItem[]>()
     for (const item of items) {
       const group = item.scope === 'global' ? 'global'
@@ -696,27 +845,22 @@ export function apply(ctx: Context, config: Config): void {
       } else {
         picks = (scopes.get(scope) || []).sort(byUpdated).slice(0, 3)
       }
-      if (picks.length) {
-        lines.push(`- ${scope}:`)
-        for (const item of picks) {
-          lines.push(`  - [${item.key} · ${ageLabel(item.updatedAt)}] ${truncate(sanitizeValue(item.value), 40)}`)
-        }
-      }
+      if (picks.length) lines.push(`- ${scope}: ${picks.map((item) => item.key).join('、')}`)
     }
-    lines.push('检索：/memory recall <关键词> 或 memory_search 可全文召回')
-    return `【记忆索引】当前记忆库可查（未做自动召回，需要时按提示检索）：\n${lines.join('\n')}`
+    lines.push('取内容：memory_search <关键词>')
+    return `【记忆索引】以下记忆可查，本会话未自动召回：\n${lines.join('\n')}`
   }
 
-  function isOwnInjected(message: unknown, text: string, form: string): boolean {
-    const msg = message as {
-      content?: Array<{ type?: string; text?: string }>
-      source?: { kind?: string; plugin?: string; form?: string }
-    }
-    if (!msg || msg.source?.kind !== 'plugin' || msg.source.plugin !== name || msg.source.form !== form) {
-      return false
-    }
-    const blocks = Array.isArray(msg.content) ? msg.content : []
-    return blocks.length === 1 && blocks[0]?.type === 'text' && blocks[0].text === text
+  // 注入去重（v0.1.19 起为 form 级）：会话历史里已有同 form 的注入即视为已注入，
+  // 不再比对正文——否则守则/召回文本一改（如精简守则上线）就会在同一会话再追加一份。
+  function isOwnInjected(message: unknown, form: string): boolean {
+    const msg = message as { source?: { kind?: string; plugin?: string; form?: string } }
+    return Boolean(
+      msg
+      && msg.source?.kind === 'plugin'
+      && msg.source.plugin === name
+      && msg.source.form === form,
+    )
   }
 
   // ── 自动记忆守则 + 自动召回 ────────────────────────────────────────────
@@ -744,7 +888,7 @@ export function apply(ctx: Context, config: Config): void {
     '1. **先查再写**：写之前必须 `memory_search` 同 scope（必要时加 global）的相近 key。已有就更新那一条，不要新建重复条目。',
     '2. **有矛盾就覆盖，不要并存**：新旧说法冲突时，更新旧条目，并在 value 里显式写「覆盖：<旧说法>」。只有两个事实都仍然成立时才保留两条。',
     '3. `memory_set(key, value, scope, tags, full)`：同 scope 同 key 直接覆盖更新；key 一旦定下就稳定复用（如 `rule.powershell-encoding`），不要每次换新名。',
-    '4. value 是 160 字以内的自足摘要（会被召回注入，越短越有用）；细节、步骤、长文放 `full`；`links` 关联同 scope 的其它 key。',
+    `4. value 是 ${valueMaxChars} 字以内的自足摘要（会被召回注入，越短越有用）；细节、步骤、长文放 \`full\`；\`links\` 关联同 scope 的其它 key。`,
     '5. 来不及确定的写法：把「最后验证日期」写进 rule.* 与 env.*，未来好判断它是否过期。',
     '',
     '## 分类（key 前缀，memory_set 硬校验）',
@@ -773,8 +917,23 @@ export function apply(ctx: Context, config: Config): void {
     '`memory_dream` 会列出过期候选（task > 30 天 / 任意 > 90 天 / 已完成 > 14 天），定期跑一次并处理掉。',
     '',
     '## 写入硬约束（不合规会被拒）',
-    'value ≤160 字（超了拆成摘要 + full）；tags ≤3；key 前缀限 `user/rule/task/ref/env/project/tool/auth/lesson`；`task.*` 必须含绝对日期；每轮对话最多写 3 条，其余留到真的需要时再说。',
+    `value ≤${valueMaxChars} 字（超长自动截断为摘要、完整原文归档进 \`full\`，不拒绝）；tags ≤3（超出拒绝）；key 前缀限 \`user/rule/task/ref/env/project/tool/auth/lesson\`（白名单外拒绝）；\`task.*\` 必须含绝对日期。`,
+    '（软自律，非闸门）每轮对话最多写 3 条，其余留到真的需要时再说。',
     'approveOnSet 开启时，先征得用户同意再带 `confirmed: true` 写入。',
+  ].join('\n')
+
+  // 精简守则（v0.1.16 引入，v0.1.20 二次压缩 476 → 212 字）：只留三样东西——
+  // 九类前缀的一词语义、该不该记的判据、以及细则去哪儿看的指路。
+  // 写入格式（value 上限、tags 数、scope 归属、相似 key 预查）移出常驻文本：
+  // memory_set 的写侧闸门会在校验失败时逐条报错，写入时的去重合并也会就地兜底。
+  const AUTO_CAPTURE_BRIEF_TEXT = [
+    '# 记忆守则（记忆插件）',
+    '',
+    '前缀：user.画像、rule.纠正、task.进展、project.定稿、env.环境、tool.坑、ref.资源、auth.凭据（仅明确要求）、lesson.教训。',
+    '',
+    '记：反复错的坑与正解、用户纠正、确认过的非常规做法、代码看不出的背景。不记：代码可推导、git 历史、修复步骤、临时进度、AGENTS.md/cairn 已覆盖。',
+    '',
+    '写入：格式与分类细则由 memory_set 校验按需返回。',
   ].join('\n')
 
   const SUBAGENT_CAPTURE_TEXT = [
@@ -828,9 +987,11 @@ export function apply(ctx: Context, config: Config): void {
         // ① 记忆守则：每会话首轮注入一次（独立 form，与召回分开去重）
         if (autoCapture && payload.step === 1) {
           const guideKey = `${sid}:capture-guide`
-          const guideText = isSubagentAgent(payload.agent) ? SUBAGENT_CAPTURE_TEXT : AUTO_CAPTURE_TEXT
+          const guideText = isSubagentAgent(payload.agent)
+            ? SUBAGENT_CAPTURE_TEXT
+            : (autoCaptureDetail === 'full' ? AUTO_CAPTURE_TEXT : AUTO_CAPTURE_BRIEF_TEXT)
           const guideForm = isSubagentAgent(payload.agent) ? 'memory-capture-guide-subagent' : AUTO_CAPTURE_FORM
-          if (!sessionInjections.has(guideKey) && !entered.some((message: unknown) => isOwnInjected(message, guideText, guideForm))) {
+          if (!sessionInjections.has(guideKey) && !entered.some((message: unknown) => isOwnInjected(message, guideForm))) {
             entered.splice(lastClaimedIndex + 1, 0, {
               role: 'user',
               id: makeId(),
@@ -843,6 +1004,7 @@ export function apply(ctx: Context, config: Config): void {
               if (oldest !== undefined) sessionInjections.delete(oldest)
             }
             sessionInjections.set(guideKey, Date.now())
+            persistInjectionState()
             changed = true
           }
         }
@@ -853,7 +1015,7 @@ export function apply(ctx: Context, config: Config): void {
         //    独立冷却（120s）防刷屏，不污染常规召回的一次性配额。
         let lessonInjected = false
         if (autoRecall) {
-          const items = await withLock(async () => readItems())
+          const items = excludeAuth(await withLock(async () => readItems()))
           const { query } = extractQuery(payload.messages)
           const isRule = ruleScene(query)
           const isRegret = regretSignal(query)
@@ -861,10 +1023,13 @@ export function apply(ctx: Context, config: Config): void {
           const lastLesson = sessionInjections.get(lessonKey)
           const lessonAllowed = lastLesson === undefined || Date.now() - lastLesson >= 120_000
           if (items.length > 0 && (isRule || isRegret) && lessonAllowed) {
-            // 同一条教训本会话已出现过（历史注入中含该 marker）则跳过，避免复述刷屏
+            // 同一条教训本会话已出现过则跳过，避免复述刷屏。
+            // v0.1.20 修：渲染格式是 `[scope/key · N 天前]`，key 后面还跟着 " · 天数"，
+            // 旧 marker `[scope/key]` 永远匹配不到 → 去重形同虚设（实测同一条教训相隔 6 分钟
+            // 被原样注入两次，白烧 503 字）。marker 保留到 " ·" 之前即可稳定命中。
             const lessons = pickLessonItems(items, isRegret, isRule, 2)
             const fresh = lessons.filter((item) => {
-              const marker = `[${item.scope}/${item.key}]`
+              const marker = `[${item.scope}/${item.key} ·`
               return !entered.some((m) => JSON.stringify(m).includes(marker))
             })
             if (fresh.length > 0) {
@@ -880,6 +1045,7 @@ export function apply(ctx: Context, config: Config): void {
                 if (oldest !== undefined) sessionInjections.delete(oldest)
               }
               sessionInjections.set(lessonKey, Date.now())
+              persistInjectionState()
               lessonInjected = true
               changed = true
             }
@@ -894,30 +1060,31 @@ export function apply(ctx: Context, config: Config): void {
             || (!autoRecallOnce && Date.now() - lastInjection >= autoRecallCooldownMs)
           if (recallAllowed) {
             const { query, hasImage } = extractQuery(payload.messages)
-            const items = await withLock(async () => readItems())
+            const items = excludeAuth(await withLock(async () => readItems()))
             if (items.length > 0) {
               const isFirstTurn = payload.step === 1
               const recalled = pickRecallItems(items, query, autoRecallLimit, autoRecallFallback, isFirstTurn, hasImage)
-              recallEmpty = recalled.length === 0
-              // LLM 语义重排（v0.1.6）：词法命中候选 ≥2 且启用时，用 LLM 挑"明确有用"的条
+              // LLM 语义重排（v0.1.6）：词法命中候选 ≥1 且启用时，用 LLM 挑"明确有用"的条
               let recalledItems = recalled
               if (autoRecallRerank && query && !hasImage && recalled.length > 0) {
                 const pool = pickRecallCandidates(items, query, autoRecallRerankMax * 4)
-                if (pool.length >= 2) {
+                if (pool.length >= 1) {
                   const picked = await rerankMemories(ctx, query, pool, autoRecallRerankMax, payload.signal)
-                  if (picked && picked.length > 0) recalledItems = picked
+                  if (picked) recalledItems = picked   // 空数组也是有效结果 → 回落索引兜底
                 }
               }
+              // recallEmpty 必须在重排之后定：否则 LLM 清零后既不注内容、也不注索引 = 白屏（v0.1.21）
+              recallEmpty = recalledItems.length === 0
               if (recalledItems.length > 0) {
                 const text = formatRecall(recalledItems, items)
-                const alreadyEntered = entered.some((message: unknown) => isOwnInjected(message, text, 'memory-recall'))
+                const alreadyEntered = entered.some((message: unknown) => isOwnInjected(message, 'memory-recall'))
                 // 已在本会话可见表面出现过则不重复注入
                 let onSurface = false
                 const surface = payload.agent?.session?.surface
                 if (!alreadyEntered && Array.isArray(surface?.nodes) && Array.isArray(payload.agent?.session?.events)) {
                   onSurface = surface.nodes.some((seq: number) => {
                     const event = payload.agent.session.events[seq]
-                    return event?.type === 'user/message' && isOwnInjected(event.data, text, 'memory-recall')
+                    return event?.type === 'user/message' && isOwnInjected(event.data, 'memory-recall')
                   })
                 }
                 if (!alreadyEntered && !onSurface) {
@@ -933,6 +1100,7 @@ export function apply(ctx: Context, config: Config): void {
               if (oldest !== undefined) sessionInjections.delete(oldest)
             }
                   sessionInjections.set(sid, Date.now())
+                  persistInjectionState()
                   changed = true
                 }
               }
@@ -960,6 +1128,11 @@ export function apply(ctx: Context, config: Config): void {
                 if (oldest !== undefined) sessionInjections.delete(oldest)
               }
               sessionInjections.set(idxKey, Date.now())
+              // v0.1.20 互斥：索引块与召回共用会话主键——首轮给过目录就不再补一次
+              // 召回，避免同一会话叠两套重叠记忆（实测索引 424 + 召回 460 = 884 字）。
+              // 需要具体内容时模型手上有 memory_search。
+              sessionInjections.set(sid, Date.now())
+              persistInjectionState()
               changed = true
             }
           }
@@ -1027,21 +1200,26 @@ export function apply(ctx: Context, config: Config): void {
       }
       const tags = normalizeTags(args.tags)
       const links = normalizeTags(args.links)
-      const full = args.full !== undefined ? (String(args.full).trim() || undefined) : undefined
+      // ── value 摘要（v0.1.15 宽容写入）─────────────────────────────────
+      // 超限不拒绝：句边界截断为摘要（末尾 … 表截断），完整原文归档进 full —— 写失败=丢信息，比超长更糟。
+      let value = String(args.value || '').trim()
+      let full = args.full !== undefined ? (String(args.full).trim() || undefined) : undefined
+      const warnings: string[] = []
+      if (value.length > valueMaxChars) {
+        const raw = value
+        value = truncate(value, valueMaxChars)
+        full = full ? `${full}\n\n${raw}` : raw
+        warnings.push(`value 摘要 ${raw.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
+      }
       // ── 写侧闸门（v0.1.7）：把守则的执行纪律变成硬约束 ──────────────
       const KEY_PREFIX_WHITELIST = ['user', 'rule', 'task', 'ref', 'env', 'project', 'tool', 'auth', 'lesson', 'plugin']
       const prefix = key.split('.')[0]
       if (!KEY_PREFIX_WHITELIST.includes(prefix) && prefix !== scope) {
         throw new Error(`memory_set: key 前缀 "${prefix}" 不在分类白名单（user/rule/task/ref/env/project/tool/auth/lesson）。项目专属记忆请把项目名写进 scope 参数、key 前缀用标准分类（如 task.xxx 配 scope=项目名）；确需项目名前缀时 scope 须与 key 前缀一致。`)
       }
-      const valueLen = String(args.value).length
-      if (valueLen > 160) {
-        throw new Error(`memory_set: value 摘要 ${valueLen} 字，超过 160 字上限。请把 value 压缩为自足摘要（≤160 字），细节写入 full 参数。`)
-      }
       if (tags.length > 3) {
         throw new Error(`memory_set: tags 最多 3 个（当前 ${tags.length} 个）。请收敛到最能代表内容的 1-3 个标签。`)
       }
-      const warnings: string[] = []
       if (prefix !== 'auth') {
         const body = `${args.value}\n${args.full ?? ''}`
         if (/password|passwd|\b密码\b|\b口令\b|\b密钥\b/i.test(body)) {
@@ -1054,6 +1232,7 @@ export function apply(ctx: Context, config: Config): void {
       if (prefix === 'task' && !/\d{4}-\d{2}-\d{2}/.test(String(args.value))) {
         warnings.push('task.* 建议在 value 中写明绝对日期（如 2026-09-03），相对时间会过期失真')
       }
+      // 已有写侧 warning 收集（见上）；若截断发生了，warnings 已含提示
       const now = new Date().toISOString()
       // 来源引证（v0.1.9）：默认自动填 日期+会话前缀；显式 source 参数优先
       const sessionId = String(exec?.agent?.session?.id ?? '')
@@ -1078,7 +1257,7 @@ export function apply(ctx: Context, config: Config): void {
           const prev = items[idx]
           items[idx] = {
             ...prev,
-            value: String(args.value),
+            value,
             full: full !== undefined ? full : prev.full,
             links: links.length ? links : prev.links,
             tags: tags.length ? tags : prev.tags,
@@ -1091,7 +1270,7 @@ export function apply(ctx: Context, config: Config): void {
             .map((item, i) => ({
               i,
               sim: item.scope === scope
-                ? contentSimilarity(item, { key, value: String(args.value), scope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem)
+                ? contentSimilarity(item, { key, value, scope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem)
                 : 0,
             }))
             .filter((entry) => entry.sim >= 0.55)
@@ -1099,7 +1278,7 @@ export function apply(ctx: Context, config: Config): void {
           if (clash) {
             warnings.push(`与已有条目 ${scope}/${items[clash.i].key} 内容高度相似（${Math.round(clash.sim * 100)}%）：请确认是否应更新该条（memory_set 同 key）而非新建`)
           }
-          items.push({ id: makeId(), key, value: String(args.value), full, links: links.length ? links : undefined, scope, tags, createdAt: now, updatedAt: now, source })
+          items.push({ id: makeId(), key, value, full, links: links.length ? links : undefined, scope, tags, createdAt: now, updatedAt: now, source })
           created = true
         }
         await writeItems(items)
@@ -1372,8 +1551,8 @@ export function apply(ctx: Context, config: Config): void {
       else if (/教训|坑|切记|注意/i.test(text)) prefix = 'lesson'
       out.push({
         key: `${prefix}.${slugKey(tag || `item${i + 1}`)}`,
-        value: text.length > 160 ? `${text.slice(0, 157)}…` : text,
-        full: text.length > 160 ? text : undefined,
+        value: text.length > valueMaxChars ? `${text.slice(0, valueMaxChars - 1)}…` : text,
+        full: text.length > valueMaxChars ? text : undefined,
         tags: [],
       })
     })
@@ -1381,7 +1560,7 @@ export function apply(ctx: Context, config: Config): void {
   }
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_import',
-    description: '把外部文件导入记忆库：CLAUDE.md / MEMORY.md / Claude Code memories.json 等。.json 按条目、.md/.txt 按段落切分，自动分配 ref/rule/lesson 前缀，value 截 160 字余量入 full，与库中已有条目内容高度相似（≥70%）自动跳过。',
+    description: `把外部文件导入记忆库：CLAUDE.md / MEMORY.md / Claude Code memories.json 等。.json 按条目、.md/.txt 按段落切分，自动分配 ref/rule/lesson 前缀，value 截 ${valueMaxChars} 字余量入 full，与库中已有条目内容高度相似（≥70%）自动跳过。`,
     parameters: {
       path: { type: 'string', required: true, description: '要导入的文件绝对路径' },
       scope: { type: 'string', description: '目标 scope，默认 global' },
@@ -1615,7 +1794,7 @@ export function apply(ctx: Context, config: Config): void {
   }
   try {
     const settingsEntry: Record<string, boolean> = {
-      autoRecall, autoCapture, autoRecallRerank, rrfRecall, approveOnSet,
+      autoRecall, autoCapture, autoRecallRerank, rrfRecall, rrfFirstTurnOnly, approveOnSet,
     }
     const settingsSvc = ctx as unknown as {
       settings: {
@@ -1630,6 +1809,7 @@ export function apply(ctx: Context, config: Config): void {
       autoCapture: z.boolean().default(true),
       autoRecallRerank: z.boolean().default(true),
       rrfRecall: z.boolean().default(true),
+      rrfFirstTurnOnly: z.boolean().default(true),
       approveOnSet: z.boolean().default(false),
     }), { base: settingsEntry, applies: 'live' })
     const applyPanel = (next?: Record<string, unknown>) => {
@@ -1638,6 +1818,7 @@ export function apply(ctx: Context, config: Config): void {
       config.autoCapture = Boolean(v.autoCapture)
       config.autoRecallRerank = Boolean(v.autoRecallRerank)
       config.rrfRecall = Boolean(v.rrfRecall)
+      config.rrfFirstTurnOnly = Boolean(v.rrfFirstTurnOnly)
       config.approveOnSet = Boolean(v.approveOnSet)
     }
     scope.watch((next) => applyPanel(next))
