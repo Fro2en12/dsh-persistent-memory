@@ -778,7 +778,11 @@ export function apply(ctx: Context, config: Config): void {
   const turnBuffers = new Map<string, string[]>()
   const lastExtractAt = new Map<string, number>()
   const lastManualWriteAt = new Map<string, number>()
-  let extractionInFlight = false
+  // M5：并发粒度——per-session 互斥 + 全局上限（修复前是全局单例布尔：两个会话同时
+  // 结束回合时后到者被静默丢弃，而它已经写过 lastExtractAt，整个冷却周期不再尝试）
+  const extractingSessions = new Set<string>()
+  let globalExtractInFlight = 0
+  const MAX_CONCURRENT_EXTRACT = 2
 
   /** M4：提炼库容量软上限——超过后提取器只接受高价值或可合并候选 */
   const EXTRACT_LIBRARY_SOFT_CAP = 500
@@ -922,9 +926,10 @@ export function apply(ctx: Context, config: Config): void {
       try {
         const agent = payload?.agent
         if (!agent || isSubagentAgent(agent)) return
-        if (extractionInFlight) return
         const sid = String(agent.session?.id ?? '')
         if (!sid) return
+        if (extractingSessions.has(sid)) return                  // 同会话不重入
+        if (globalExtractInFlight >= MAX_CONCURRENT_EXTRACT) return  // 超全局上限：本次放弃，且不写冷却（下轮可重试）
         const now = Date.now()
         const last = lastExtractAt.get(sid)
         if (last !== undefined && now - last < autoExtractCooldownMs) return
@@ -932,11 +937,17 @@ export function apply(ctx: Context, config: Config): void {
         if (manual !== undefined && now - manual < 30_000) return
         const buf = turnBuffers.get(sid)
         if (!buf || buf.length === 0) return
+        // 冷却与占位在「真正发起请求」之后才写：修复前先写 lastExtractAt 再 return，
+        // 被上限/互斥跳过的会话会白等一个冷却周期
+        extractingSessions.add(sid)
+        globalExtractInFlight += 1
         lastExtractAt.set(sid, now)
-        extractionInFlight = true
         void extractAndWrite(sid, buf.join('\n').slice(-4000))
           .catch((err) => ctx.logger.debug('[mem] extract failed: %o', err))
-          .finally(() => { extractionInFlight = false })
+          .finally(() => {
+            extractingSessions.delete(sid)
+            globalExtractInFlight -= 1
+          })
       } catch { /* 观察者绝不抛 */ }
     }, { global: true })
   }
