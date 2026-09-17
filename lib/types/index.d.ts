@@ -51,6 +51,8 @@ export interface Config {
     approveOnSet?: boolean;
     /** value 摘要存储上限（默认 240）：超长自动句边界截断，完整原文归档进 full，不拒绝写入 */
     valueMaxChars?: number;
+    /** full 完整正文总长上限（默认 8000）：超出截断，避免同一 key 反复更新导致无限膨胀 */
+    fullMaxChars?: number;
     /** task.* 保鲜期（天，默认 30）：超期在召回评分中降权，避免过时任务状态被当成现状 */
     taskTtlDays?: number;
     /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
@@ -84,6 +86,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     rrfFirstTurnOnly: z<boolean, boolean>;
     approveOnSet: z<boolean, boolean>;
     valueMaxChars: z<number, number>;
+    fullMaxChars: z<number, number>;
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;
@@ -113,6 +116,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     rrfFirstTurnOnly: z<boolean, boolean>;
     approveOnSet: z<boolean, boolean>;
     valueMaxChars: z<number, number>;
+    fullMaxChars: z<number, number>;
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;

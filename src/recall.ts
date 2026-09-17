@@ -31,10 +31,11 @@ export const WEAK_WORDS = [
   '命令', '配置', '设置', '项目', '状态', '记录', '内容', '数据',
 ]
 
+// m3：预编译为单个正则（原实现对每个 token 遍历约 110 个词做 split/join，
+// 1000 条库 × 12 token × 110 词 ≈ 每轮 130 万次字符串分割）
+const NOISE_RE = new RegExp(NOISE_WORDS.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g')
 export function stripNoise(token: string): string {
-  let s = token.toLowerCase()
-  for (const w of NOISE_WORDS) s = s.split(w).join('')
-  return s
+  return token.toLowerCase().replace(NOISE_RE, '')
 }
 
 export function expandToken(token: string): string[] {
@@ -191,9 +192,11 @@ export function lexicalHit(item: MemoryItem, query: string): boolean {
 }
 
 // RRF 倒数排名融合：词法分 + bigram 相似度双排名（对标 dsh-evolve 的零 token 混合召回）
-export function rrfRanking(items: MemoryItem[], query: string, env: ScoreEnv): { item: MemoryItem; rrf: number }[] {
+export function rrfRanking(items: MemoryItem[], query: string, env: ScoreEnv, isFirstTurn = false): { item: MemoryItem; rrf: number }[] {
   if (!query || items.length === 0) return []
-  const lex = items.map((item) => ({ item, s: scoreItem(item, query, false, env) }))
+  // m5：首轮补位此前恒用非首轮评分（含信号词扩展与无关 scope 的 -4 降权而非首轮排除），
+  // 与首轮语义冲突；现由调用方透传 isFirstTurn
+  const lex = items.map((item) => ({ item, s: scoreItem(item, query, isFirstTurn, env) }))
   const bi = items.map((item) => ({ item, s: bigramJaccard(query, `${item.key} ${item.value}`) }))
   const rankMap = (arr: { item: MemoryItem; s: number }[]) => {
     const sorted = [...arr].sort((a, b) => b.s - a.s)
@@ -241,6 +244,9 @@ export function pickRecallItems(
     return b.item.updatedAt.localeCompare(a.item.updatedAt)
   })
   // 阈值（v0.1.17）：绝对下限 + 相对比例组合。首轮仍用固定 6（一次 key 直中 + 少量辅助）。
+  // m1（口径明确化）：首轮要过 6 分必须 key 命中（key 全等 9 / 部分命中 5）再加少量辅助分；
+  // 仅 value 命中只有 2 分（弱主题词 1 分），所以「只记得内容里的词」在首轮召不到——
+  // 设计意图是首轮只按 key/画像召回，内容检索交给 memory_search（README 已同步说明）。
   const minScore = isFirstTurn ? 6 : env.minScore
   const best = scored.length > 0 ? scored[0].score : 0
   const relativeFloor = (!isFirstTurn && env.relativeFloor > 0 && best > 0)
@@ -254,7 +260,7 @@ export function pickRecallItems(
   if (env.rrfRecall && (!env.rrfFirstTurnOnly || isFirstTurn) && top.length === 0 && query) {
     // 补位也必须真的沾边：共享中文二元组/英文词元才算相关。
     const minOverlap = isFirstTurn ? 2 : 1
-    const ranked = rrfRanking(scoped, query, env).filter((e) => {
+    const ranked = rrfRanking(scoped, query, env, isFirstTurn).filter((e) => {
       if (e.rrf < 0.025) return false
       return semanticOverlap(query, `${e.item.key} ${e.item.value}`) >= minOverlap
     })

@@ -21,6 +21,8 @@ export interface StoreFs {
     /** 清理 tmp 残留与释放写锁（必填：缺失会导致锁泄漏） */
     unlink(path: string): Promise<void>;
 }
+/** n3：JSONL 首行 schema 哨兵——未来字段迁移的抓手（读取时跳过，不计入条目/坏行） */
+export declare const SCHEMA_SENTINEL = "{\"__schema\":1}";
 export interface StoreOptions {
     fs: StoreFs;
     dataDir: string;

@@ -53,7 +53,7 @@ describe('M4 提取器去重', () => {
     const s = await stats(fake)
     expect(s.total).toBe(1)
     const raw = readFileSync(join(dir, 'memory.jsonl'), 'utf8')
-    expect(raw.trim().split('\n')).toHaveLength(1)
+    expect(raw.trim().split('\n').filter((l) => !l.includes('__schema'))).toHaveLength(1)   // 排除 n3 哨兵行
   })
 
   it('与已有条目高度相似的候选 → 更新而非新建', async () => {

@@ -23,6 +23,9 @@ export interface StoreFs {
   unlink(path: string): Promise<void>
 }
 
+/** n3：JSONL 首行 schema 哨兵——未来字段迁移的抓手（读取时跳过，不计入条目/坏行） */
+export const SCHEMA_SENTINEL = '{"__schema":1}'
+
 export interface StoreOptions {
   fs: StoreFs
   dataDir: string
@@ -178,7 +181,9 @@ export function createStore(opts: StoreOptions): MemoryStore {
       const trimmed = line.trim()
       if (!trimmed) continue
       try {
-        const parsed = JSON.parse(trimmed) as Partial<MemoryItem>
+        const parsed = JSON.parse(trimmed) as Partial<MemoryItem> & { __schema?: unknown }
+        // n3：schema 哨兵行既不是条目也不是坏行
+        if (parsed && typeof parsed.__schema === 'number') continue
         // M1 行级规范化：一行不合法只丢一行并计数——修复前单条缺 scope 脏行
         // 会让 scoreItem 的 item.scope.toLowerCase() 崩掉整条召回链（守则/教训/召回/索引全停）。
         // 口径：key/value 必须为 string、scope 缺省/非 string、tags 非数组 → 坏行 dropped++；
@@ -243,7 +248,7 @@ export function createStore(opts: StoreOptions): MemoryStore {
         }
       }
       await opts.fs.mkdir(opts.dataDir, { recursive: true })
-      const body = items.map((item) => JSON.stringify(item)).join('\n') + '\n'
+      const body = SCHEMA_SENTINEL + '\n' + items.map((item) => JSON.stringify(item)).join('\n') + '\n'
       // B2：写前把当前主文件复制为 .bak（保留 1 份上一版完整快照）
       try {
         await opts.fs.copyFile(opts.dataFile, bakFile)

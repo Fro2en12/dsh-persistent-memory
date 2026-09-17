@@ -20,7 +20,7 @@ export interface ScoreEnv {
 }
 export declare function scoreItem(item: MemoryItem, query: string, isFirstTurn: boolean, env: ScoreEnv): number;
 export declare function lexicalHit(item: MemoryItem, query: string): boolean;
-export declare function rrfRanking(items: MemoryItem[], query: string, env: ScoreEnv): {
+export declare function rrfRanking(items: MemoryItem[], query: string, env: ScoreEnv, isFirstTurn?: boolean): {
     item: MemoryItem;
     rrf: number;
 }[];

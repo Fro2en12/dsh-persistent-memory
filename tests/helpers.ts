@@ -20,6 +20,8 @@ export interface FakeCtx {
   routes: any[]
   settingsService: FakeSettingsService
   logs: Array<{ level: string; message: string }>
+  /** 收集 ctx.effect 注册的清理函数（m6/m7 生命周期断言用） */
+  effects: Array<{ name: string; cleanup: (() => void) | void }>
 }
 
 /** 构造 apply() 所需的最小 fake ctx（不加载 cordis/dsh 运行时）；services 可注入 llm/sessionQuery 等 */
@@ -32,6 +34,7 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}, services: R
   const handlers = new Map<string, any[]>()
   const routes: any[] = []
   const logs: Array<{ level: string; message: string }> = []
+  const effects: Array<{ name: string; cleanup: (() => void) | void }> = []
   // 模拟 cordis logger 的 printf 插值（%s/%d/%o/%O/%i），让审计日志断言可验证
   const formatLog = (message: unknown, args: unknown[]): string => {
     let i = 0
@@ -72,7 +75,7 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}, services: R
   const ctx: any = {
     tools: { register: (def: any) => { toolDefs.set(def.name, def) } },
     commands: { register: (def: any) => { commandDefs.push(def) } },
-    effect: (fn: () => (() => void) | void) => { fn() },
+    effect: (fn: () => (() => void) | void, effectName?: string) => { effects.push({ name: String(effectName ?? ''), cleanup: fn() }) },
     inject: (_deps: string[], cb: (webCtx: any) => void) => {
       const webCtx = {
         effect: (fn: () => (() => void) | void) => { fn() },
@@ -93,7 +96,7 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}, services: R
     },
     settings: settingsService,
   }
-  return { ctx, state, watchers, toolDefs, commandDefs, handlers, routes, settingsService, logs }
+  return { ctx, state, watchers, toolDefs, commandDefs, handlers, routes, settingsService, logs, effects }
 }
 
 /** 每个用例独立的临时 dataDir，测试结束清理 */

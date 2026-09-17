@@ -96,6 +96,8 @@ export interface Config {
   approveOnSet?: boolean
   /** value 摘要存储上限（默认 240）：超长自动句边界截断，完整原文归档进 full，不拒绝写入 */
   valueMaxChars?: number
+  /** full 完整正文总长上限（默认 8000）：超出截断，避免同一 key 反复更新导致无限膨胀 */
+  fullMaxChars?: number
   /** task.* 保鲜期（天，默认 30）：超期在召回评分中降权，避免过时任务状态被当成现状 */
   taskTtlDays?: number
   /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
@@ -130,6 +132,7 @@ export const Config = z.object({
   rrfFirstTurnOnly: z.boolean().default(true),
   approveOnSet: z.boolean().default(false),
   valueMaxChars: z.number().default(240),
+  fullMaxChars: z.number().default(8000),
   taskTtlDays: z.number().default(30),
   autoExtract: z.boolean().default(true),
   autoExtractCooldownMs: z.number().default(120 * 1000),
@@ -186,6 +189,8 @@ export function apply(ctx: Context, config: Config): void {
   // value 存储上限（写侧，v0.1.15）：与注入展示上限 autoRecallMaxChars（160）分离——
   // 展示截断只影响本次注入 token 预算；存储摘要上限决定"自足摘要能写多全"。
   const valueMaxChars = Math.max(120, config.valueMaxChars || 240)
+  // m9：full 总长上限——修复前同一 key 反复超长更新会把原文一再追加进 full，无限膨胀
+  const fullMaxChars = Math.max(1000, config.fullMaxChars || 8000)
 
   // ── 运行时开关（B1 修复，v0.1.23）───────────────────────────────────
   // 设置面板 applyPanel 只写 runtime；全部消费点只读 runtime。
@@ -312,23 +317,33 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   let persistTimer: ReturnType<typeof setTimeout> | null = null
+  async function persistInjectionStateNow(): Promise<void> {
+    try {
+      await fs.mkdir(dataDir, { recursive: true })
+      const entries: Record<string, number> = {}
+      for (const [key, ts] of sessionInjections) entries[key] = ts
+      await fs.writeFile(injectionStateFile, JSON.stringify({ version: 1, entries }), 'utf8')
+    } catch {
+      // 写失败只降低去重效果，不阻塞注入流程
+    }
+  }
   function persistInjectionState(): void {
     if (persistTimer) return
     persistTimer = setTimeout(() => {
       persistTimer = null
-      void (async () => {
-        try {
-          await fs.mkdir(dataDir, { recursive: true })
-          const entries: Record<string, number> = {}
-          for (const [key, ts] of sessionInjections) entries[key] = ts
-          await fs.writeFile(injectionStateFile, JSON.stringify({ version: 1, entries }), 'utf8')
-        } catch {
-          // 写失败只降低去重效果，不阻塞注入流程
-        }
-      })()
+      void persistInjectionStateNow()
     }, 500)
     persistTimer.unref?.()
   }
+  // m7：卸载/热重载时 flush——否则进程在 500ms 去抖窗口内退出会丢掉本次注入记录，
+  // 重启后同一会话重复注入守则/召回
+  ctx.effect(() => () => {
+    if (persistTimer) {
+      clearTimeout(persistTimer)
+      persistTimer = null
+    }
+    void persistInjectionStateNow()
+  }, 'dsh-persistent-memory: flush injection state')
 
   loadInjectionState()
 
@@ -788,6 +803,15 @@ export function apply(ctx: Context, config: Config): void {
   const turnBuffers = new Map<string, string[]>()
   const lastExtractAt = new Map<string, number>()
   const lastManualWriteAt = new Map<string, number>()
+  // m7：会话级 Map 的廉价上限（依赖 Map 插入顺序删最旧），避免长生命周期进程无界增长
+  function setBounded<K, V>(map: Map<K, V>, key: K, value: V, max = 200): void {
+    map.set(key, value)
+    while (map.size > max) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
+  }
   // M5：并发粒度——per-session 互斥 + 全局上限（修复前是全局单例布尔：两个会话同时
   // 结束回合时后到者被静默丢弃，而它已经写过 lastExtractAt，整个冷却周期不再尝试）
   const extractingSessions = new Set<string>()
@@ -951,7 +975,7 @@ export function apply(ctx: Context, config: Config): void {
         // 被上限/互斥跳过的会话会白等一个冷却周期
         extractingSessions.add(sid)
         globalExtractInFlight += 1
-        lastExtractAt.set(sid, now)
+        setBounded(lastExtractAt, sid, now)
         void extractAndWrite(sid, buf.join('\n').slice(-4000))
           .catch((err) => ctx.logger.debug('[mem] extract failed: %o', err))
           .finally(() => {
@@ -979,14 +1003,17 @@ export function apply(ctx: Context, config: Config): void {
         if (decision?.kind === 'reject') return decision
         if (payload.signal?.aborted) return decision
         if (payload.step === 1 && (!Array.isArray(decision.messages) || decision.messages.length === 0)) return decision
-        if (payload.step === 1) {
-          const header = payload.agent?.session?.header ?? payload.agent?.session
-          ctx.logger.debug('[mem] agent probe %o', {
+        // n4：只在判定为子代理时打 debug，并附 isSubagentAgent 的返回值——
+        // 修复前每个新会话首步都打一条探测日志，且只打原始字段不打判定结果
+        const isSubAgentForLog = isSubagentAgent(payload.agent)
+        if (payload.step === 1 && isSubAgentForLog) {
+          const header = payload.agent?.session?.header ?? {}
+          ctx.logger.debug('[mem] subagent detected %o', {
+            isSubagentAgent: isSubAgentForLog,
             origin: header?.origin,
             parent: header?.parentSession,
             depth: header?.delegationDepth,
             optDepth: payload.agent?.options?.subagentDepth,
-            role: payload.agent?.role ?? header?.role,
             id: payload.agent?.session?.id,
           })
         }
@@ -1228,11 +1255,19 @@ export function apply(ctx: Context, config: Config): void {
     let value = String(input.value || '').trim()
     let full = input.full !== undefined ? (String(input.full).trim() || undefined) : undefined
     const warnings: string[] = []
+    const nowStamp = new Date().toISOString()
     if (value.length > valueMaxChars) {
       const rawValue = value
       value = truncate(value, valueMaxChars)
-      full = full ? `${full}\n\n${rawValue}` : rawValue
+      // m9：最新一次原文置顶（带时间戳标记），旧内容保留在尾部但整体受 fullMaxChars 约束——
+      // 修复前是尾部追加，full 会随更新次数单调膨胀
+      const stamped = `<!-- ${nowStamp} -->\n${rawValue}`
+      full = full ? `${stamped}\n\n${full}`.slice(0, fullMaxChars) : stamped.slice(0, fullMaxChars)
       warnings.push(`value 摘要 ${rawValue.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
+    }
+    if (full !== undefined && full.length > fullMaxChars) {
+      full = full.slice(0, fullMaxChars)
+      warnings.push(`full 超过 ${fullMaxChars} 字上限，已截断`)
     }
     // ── 写侧闸门（v0.1.7）：实测闸门；文案与守则同源（KEY_PREFIX_LIST 见 types.ts / write-gate.ts）──
     validateKeyPrefix(key, scope)
@@ -1251,7 +1286,7 @@ export function apply(ctx: Context, config: Config): void {
     if (prefix === 'task' && !/\d{4}-\d{2}-\d{2}/.test(String(input.value))) {
       warnings.push('task.* 建议在 value 中写明绝对日期（如 2026-09-03），相对时间会过期失真')
     }
-    const now = new Date().toISOString()
+    const now = nowStamp
     // 来源引证（v0.1.9）：默认自动填 日期+会话前缀；显式 source 参数优先
     const sessionId = String(exec?.agent?.session?.id ?? '')
     const source = (input.source || '').trim() || `${now.slice(0, 10)}${sessionId ? ` s=${sessionId.slice(0, 8)}` : ''}`
@@ -1277,7 +1312,7 @@ export function apply(ctx: Context, config: Config): void {
       await writeItems(items)
       return { result, clashWarning }
     }))
-    if (sessionId) lastManualWriteAt.set(sessionId, Date.now())
+    if (sessionId) setBounded(lastManualWriteAt, sessionId, Date.now())
     const allWarnings = outcome.clashWarning ? [...warnings, outcome.clashWarning] : warnings
     return {
       ok: true,
@@ -1535,12 +1570,20 @@ export function apply(ctx: Context, config: Config): void {
     async execute() {
       return withLock(async () => {
         const items = await readItems()
-        const scopes: Record<string, number> = {}
+        // m12：Object.create(null) —— scope 是模型/用户可控字符串，'constructor' 等
+        // 原型链键会让计数变成 "function Object() { [native code] }1"
+        const scopes: Record<string, number> = Object.create(null)
         for (const item of items) scopes[item.scope] = (scopes[item.scope] || 0) + 1
         return { total: items.length, scopes, dropped: store.getDropped() }
       })
     },
   })), '@dsh-external/dsh-persistent-memory: memory_stats')
+
+  // m2：完成态判定锚定状态语义——修复前 /done|completed|已完成|完成/ 会把
+  // 「任务完成后运行测试」这类含"完成"二字的规则误判为「标记完成」而列入候选。
+  const isCompletedMark = (value: string): boolean =>
+    // 注意：中文后不能用 \b（'已完成' 的 '成' 不是 \w，边界不成立）
+    /^(已完成|done|completed)(?![\w\u4e00-\u9fff])|\bstatus\s*[:=]\s*(done|completed)/i.test(value.trim())
 
   // ── 记忆代谢（v0.1.9）：列出过期候选，由模型决定更新/归档/删除 ────────
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -1576,7 +1619,7 @@ export function apply(ctx: Context, config: Config): void {
             let suggest = ''
             if (item.key.startsWith('task.') && ageDays > 30) { reason = 'task 状态超过 30 天未更新'; suggest = '确认是否已完成/过时：更新 value 或 memory_forget' }
             else if (ageDays > 90) { reason = '超过 90 天未更新'; suggest = '归档（详情挪 full）或 memory_forget' }
-            else if (/done|completed|已完成|完成/.test(item.value) && ageDays > 14) { reason = '标记完成已超 14 天'; suggest = 'memory_forget 或归档' }
+            else if (isCompletedMark(item.value) && ageDays > 14) { reason = '标记完成已超 14 天'; suggest = 'memory_forget 或归档' }
             return { key: item.key, scope: item.scope, ageDays, reason, suggest }
           })
           .filter((c) => c.reason)
@@ -1745,13 +1788,13 @@ export function apply(ctx: Context, config: Config): void {
   })), '@dsh-external/dsh-persistent-memory: memory_recall')
 
   // ── /memory 斜杠命令：人直接查看/写入记忆，不依赖模型调用工具 ────────
-  ctx.commands.register({
+  ctx.effect(() => ctx.commands.register({
     name: 'memory',
-    description: '查看/写入持久记忆：status / recall <查询> / remember <key> <内容> / forget <key> / dream / import <文件> / panel',
-    input: { hint: '<status|recall <查询>|remember <key> <内容>|forget <key>|dream|import <文件>|panel>' },
+    description: '查看/写入持久记忆：status / recall <查询> / remember <key> <内容> / forget <key> / dream / import <文件> / export <文件> / restore <文件> / panel',
+    input: { hint: '<status|recall <查询>|remember <key> <内容>|forget <key>|dream|import <文件>|export <文件>|restore <文件>|panel>' },
     recordInput: false,
     handler: (invocation) => executeMemoryCommand(invocation),
-  })
+  }), 'dsh-external/dsh-persistent-memory: /memory command')
 
   // 自包含 HTML 记忆面板（v0.1.9）：浏览器打开即用，数据内嵌 JSON，支持搜索
   function buildPanelHtml(items: { scope: string; key: string; value: string; tags: string[]; updatedAt: string }[]): string {
@@ -1831,7 +1874,7 @@ export function apply(ctx: Context, config: Config): void {
             let suggest = ''
             if (item.key.startsWith('task.') && ageDays > 30) { reason = 'task 状态超 30 天未更新'; suggest = '更新或删除' }
             else if (ageDays > 90) { reason = '超 90 天未更新'; suggest = '归档或删除' }
-            else if (/done|completed|已完成|完成/.test(item.value) && ageDays > 14) { reason = '标记完成超 14 天'; suggest = '删除或归档' }
+            else if (isCompletedMark(item.value) && ageDays > 14) { reason = '标记完成超 14 天'; suggest = '删除或归档' }
             return { item, ageDays, reason, suggest }
           })
           .filter((c) => c.reason)
@@ -1853,8 +1896,15 @@ export function apply(ctx: Context, config: Config): void {
       case 'panel': {
         const items = await withLock(async () => readItems())
         const safe = items.filter((i) => !i.key.startsWith('auth.')).map((i) => ({ scope: i.scope, key: i.key, value: sanitizeValue(i.value), tags: i.tags, updatedAt: i.updatedAt }))
-        const outPath = join(process.cwd(), `memory-panel-${new Date().toISOString().slice(0, 10)}.html`)
-        await fs.writeFile(outPath, buildPanelHtml(safe), 'utf8')
+        // m8：写到 dataDir 而非 process.cwd()（host 进程目录，用户不会去那里找，
+        // 且可能是只读目录导致命令直接抛错）
+        const outPath = join(dataDir, `memory-panel-${new Date().toISOString().slice(0, 10)}.html`)
+        try {
+          await fs.mkdir(dataDir, { recursive: true })
+          await fs.writeFile(outPath, buildPanelHtml(safe), 'utf8')
+        } catch (err) {
+          return { kind: 'error', text: '生成面板失败：' + String(err instanceof Error ? err.message : err) }
+        }
         return { kind: 'success', text: `已生成记忆面板：${outPath}\n浏览器打开即可浏览/搜索全部记忆（auth.* 凭据已排除）。` }
       }
       default:
