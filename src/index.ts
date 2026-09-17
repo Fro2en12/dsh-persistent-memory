@@ -26,8 +26,10 @@ import type { MemoryItem } from './types.js'
 import { sanitizeValue } from './sanitize.js'
 import {
   ageLabel,
+  bigramJaccard,
   contentSimilarity,
   fitBudget,
+  keySimilarity,
   lexicalHit,
   pickRecallItems,
   rrfRanking,
@@ -778,6 +780,9 @@ export function apply(ctx: Context, config: Config): void {
   const lastManualWriteAt = new Map<string, number>()
   let extractionInFlight = false
 
+  /** M4：提炼库容量软上限——超过后提取器只接受高价值或可合并候选 */
+  const EXTRACT_LIBRARY_SOFT_CAP = 500
+
   /** 提取器落盘路径：与 memory_set 同源的最小闸门（前缀白名单/凭据词/value 截断/tags 裁剪）。
    *  @returns 是否真的写入（被闸门拦截返回 false，调用方继续尝试下一条候选）。 */
   async function writeExtractedMemory(raw: { key?: unknown; value?: unknown; tags?: unknown[] }): Promise<boolean> {
@@ -792,18 +797,37 @@ export function apply(ctx: Context, config: Config): void {
     if (value.length > valueMaxChars) value = truncate(value, valueMaxChars)
     const tags = Array.isArray(raw.tags) ? raw.tags.map((t) => String(t)).filter(Boolean).slice(0, 3) : []
     const now = new Date().toISOString()
+    let written = false
     await withLock(() => withConflictRetry(async () => {
       const items = await readItems()
-      const idx = items.findIndex((item) => item.scope === defaultScope && item.key === key)
-      if (idx >= 0) {
-        const prev = items[idx]
-        items[idx] = { ...prev, value, tags: tags.length ? tags : prev.tags, updatedAt: now, source: '轮末提取' }
-      } else {
-        items.push({ id: makeId(), key, value, scope: defaultScope, tags, createdAt: now, updatedAt: now, source: '轮末提取' })
+      // M4 容量软上限：无人值守的提取器不能无限撑大库（scoreItem 与全量重写随条数线性劣化）。
+      // 超限后只接受两类候选：rule./lesson. 高价值条目，或「其实是在更新已有记忆」（足够相似）。
+      if (items.length > EXTRACT_LIBRARY_SOFT_CAP && prefix !== 'rule' && prefix !== 'lesson') {
+        const mergeable = items.some((item) => item.scope === defaultScope
+          && (keySimilarity(item.key, key) >= 0.6 || bigramJaccard(item.value, value) >= 0.6))
+        if (!mergeable) {
+          written = false
+          return
+        }
       }
+      // M4：复用 memory_set 的合并逻辑——修复前只按精确 key 匹配，同一事实的 key 漂移
+      // （env.node-version / env.nodejs-version / tool.node-version）每次都新建一条。
+      upsertMemory(items, {
+        key,
+        value,
+        full: undefined,
+        links: [],
+        tags,
+        scope: defaultScope,
+        createdAt: now,
+        updatedAt: now,
+        source: '轮末提取',
+        explicitSource: true,
+      }, { dedupe: true, makeId })
       await writeItems(items)
+      written = true
     }))
-    return true
+    return written
   }
 
   const EXTRACTION_SYSTEM_PROMPT = [
