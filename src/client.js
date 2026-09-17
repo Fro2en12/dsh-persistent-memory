@@ -1,4 +1,4 @@
-// dsh-persistent-memory browser half — settings.section with five switches.
+// dsh-persistent-memory browser half — settings.section with six switches.
 // Loader protocol: window.__ModuleLoader__.load (same envelope as dsh-email).
 window.__ModuleLoader__.load({ id: "@dsh-external/dsh-persistent-memory", factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
@@ -33,6 +33,7 @@ const FIELDS = [
   ["autoCapture", "自动捕获：每会话注入自动记忆守则"],
   ["autoRecallRerank", "回忆重排：LLM 从候选里挑「明确有用」的"],
   ["rrfRecall", "RRF 召回：词法零命中时按语义补位"],
+  ["rrfFirstTurnOnly", "RRF 首轮限定：语义补位只在首轮生效"],
   ["approveOnSet", "写入审批：记忆写入前需征得用户同意"],
 ];
 

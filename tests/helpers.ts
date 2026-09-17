@@ -32,8 +32,14 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}): FakeCtx {
   const routes: any[] = []
 
   const settingsService: FakeSettingsService = {
-    register(ns, _schema, _opts) {
-      const cur = () => (state[ns] as Record<string, unknown> | undefined) ?? {}
+    register(ns, _schema, opts) {
+      // 对齐 DSH settings 契约：get() = schema 默认值 ← base ← 用户层
+      const DEFAULTS: Record<string, unknown> = {
+        autoRecall: true, autoCapture: true, autoRecallRerank: true,
+        rrfRecall: true, rrfFirstTurnOnly: true, approveOnSet: false,
+      }
+      const base = (opts?.base as Record<string, unknown> | undefined) ?? {}
+      const cur = () => ({ ...DEFAULTS, ...base, ...((state[ns] as Record<string, unknown> | undefined) ?? {}) })
       return { get: cur, watch: (fn) => { watchers.push(fn) } }
     },
     describe: () => [{ ns: 'dsh-persistent-memory', revision }],
