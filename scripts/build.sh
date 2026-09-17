@@ -49,6 +49,7 @@ node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recur
 link_pkg cordis vendor/cordis
 link_pkg cosmokit vendor/cosmokit
 link_pkg schemastery vendor/schemastery
+link_pkg @deepseek-ai/schemastery vendor/schemastery
 link_pkg @deepseek-ai/dsh-tools packages/core/tools
 link_pkg @deepseek-ai/dsh-llm packages/llm/llm
 link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
@@ -70,4 +71,6 @@ fi
 
 echo "=== Compiling src → lib ==="
 "$TSC" -p tsconfig.json
+# N5：src/client.js 不在 tsc 编译面内（无 allowJs），必须显式产出
+cp src/client.js lib/client.js
 echo "=== Build complete ==="
