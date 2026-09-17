@@ -1,5 +1,9 @@
 import type { MemoryItem } from './types.js';
-/** scope 归一：未传/空白回退 defaultScope，仅 trim（大小写归一见 M8） */
+/**
+ * scope 归一（M8，v0.1.23）：trim + 统一小写。
+ * 修复前只 trim：scope='Global' 既不是 'global'（索引分组失败）也不含小写工作区名，
+ * 同一逻辑作用域裂成多个物理 scope（该条在索引中隐身、按 scope 精确检索查不到）。
+ */
 export declare function normalizeScope(scope: string | undefined, defaultScope: string): string;
 /** key 前缀白名单硬校验：与守则文本同源（KEY_PREFIX_LIST） */
 export declare function validateKeyPrefix(key: string, scope: string): void;

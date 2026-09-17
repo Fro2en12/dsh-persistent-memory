@@ -26,10 +26,10 @@ const env = {
 }
 
 describe('M9 提取基线：write-gate', () => {
-  it('normalizeScope 只 trim 并回退默认值（当前行为，M8 才归一大小写）', () => {
+  it('normalizeScope：trim + 归一大小写 + 回退默认值（M8 起生效）', () => {
     expect(normalizeScope(undefined, 'global')).toBe('global')
     expect(normalizeScope('  ', 'global')).toBe('global')
-    expect(normalizeScope('  Global  ', 'global')).toBe('Global')
+    expect(normalizeScope('  Global  ', 'global')).toBe('global')
   })
 
   it('validateKeyPrefix 拒绝白名单外前缀', () => {

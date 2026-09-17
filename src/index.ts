@@ -213,6 +213,34 @@ export function apply(ctx: Context, config: Config): void {
   const readItems = (): Promise<MemoryItem[]> => store.readItems()
   const writeItems = (items: MemoryItem[]): Promise<void> => store.writeItems(items)
 
+  // M8：启动时一次性迁移历史数据里的大小写非规范 scope（改前的手工编辑/旧版本产物）
+  async function migrateScopeCase(): Promise<void> {
+    try {
+      const renamed = await withLock(() => withConflictRetry(async () => {
+        const items = await readItems()
+        const changed: string[] = []
+        let dirty = false
+        for (const item of items) {
+          const lower = item.scope.toLowerCase()
+          if (lower !== item.scope) {
+            changed.push(item.key + '(' + item.scope + ' → ' + lower + ')')
+            item.scope = lower
+            dirty = true
+          }
+        }
+        if (!dirty) return [] as string[]
+        await writeItems(items)
+        return changed
+      }))
+      if (renamed.length > 0) {
+        ctx.logger.warn('dsh-persistent-memory: 启动迁移：%d 条记忆的 scope 已归一为小写：%s', renamed.length, renamed.slice(0, 20).join('、'))
+      }
+    } catch (err) {
+      ctx.logger.warn('dsh-persistent-memory: scope 归一迁移失败（不影响使用）：%o', err)
+    }
+  }
+  void migrateScopeCase()
+
   // 检索公共实现：memory_search 工具与 /memory recall 命令共用
   async function searchItems(options: {
     query?: string
@@ -582,8 +610,10 @@ export function apply(ctx: Context, config: Config): void {
     const items = excludeCredentials(rawItems).filter((item) => !excludeKeys?.has(`${item.scope}/${item.key}`))
     const scopes = new Map<string, MemoryItem[]>()
     for (const item of items) {
-      const group = item.scope === 'global' ? 'global'
-        : (currentWorkspaceScopes().some((ws) => item.scope.includes(ws) || ws.includes(item.scope)) ? item.scope : null)
+      // M8：分组键与 order（均为小写）用同一口径比较，避免 'Global'/'Thesis' 类大小写差异导致条目在索引中隐身
+      const sc = item.scope.toLowerCase()
+      const group = sc === 'global' ? 'global'
+        : (currentWorkspaceScopes().some((ws) => sc.includes(ws) || ws.includes(sc)) ? sc : null)
       if (!group) continue
       if (!scopes.has(group)) scopes.set(group, [])
       scopes.get(group)!.push(item)

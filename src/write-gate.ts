@@ -2,9 +2,13 @@ import { KEY_PREFIX_WHITELIST, KEY_PREFIX_LIST } from './types.js'
 import type { MemoryItem } from './types.js'
 import { contentSimilarity, keySimilarity } from './recall.js'
 
-/** scope 归一：未传/空白回退 defaultScope，仅 trim（大小写归一见 M8） */
+/**
+ * scope 归一（M8，v0.1.23）：trim + 统一小写。
+ * 修复前只 trim：scope='Global' 既不是 'global'（索引分组失败）也不含小写工作区名，
+ * 同一逻辑作用域裂成多个物理 scope（该条在索引中隐身、按 scope 精确检索查不到）。
+ */
 export function normalizeScope(scope: string | undefined, defaultScope: string): string {
-  const s = (scope || defaultScope).trim()
+  const s = (scope || defaultScope).trim().toLowerCase()
   return s || 'global'
 }
 
