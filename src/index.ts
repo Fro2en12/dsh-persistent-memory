@@ -38,7 +38,7 @@ import {
   type RecallEnv,
   type ScoreEnv,
 } from './recall.js'
-import { findCredentialMatch, isCredentialItem, maskCredential, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
+import { findCredentialMatch, isCredentialItem, maskCredential, matchesRedactPattern, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
 import { parseImportEntries } from './import.js'
 import { createStore, withConflictRetry, type StoreFileHandle, type StoreFs } from './store.js'
 
@@ -72,7 +72,7 @@ export interface Config {
   autoRecallFallback?: boolean
   /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
   autoCapture?: boolean
-  /** 守则详略：brief（默认，约 210 字）| full（完整九类细则，约 3000 字） */
+  /** 守则详略：brief（默认，实测约 282 字，口径与 README 统一写「约 300 字」）| full（完整九类细则，约 3000 字） */
   autoCaptureDetail?: 'brief' | 'full'
   /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
   injectionBudgetChars?: number
@@ -109,6 +109,14 @@ export interface Config {
   autoExtract?: boolean
   /** memory_import 允许的根目录白名单；缺省为 [DSH_WORKSPACE]（无环境变量时拒绝导入） */
   importAllowRoots?: string[]
+  /**
+   * T10（第五轮）：是否允许通过 memory_get 的 confirmed:true 取回 auth.* 与凭据类记忆的原文。
+   * 默认 false —— confirmed 是模型自己填的 schema 参数，不构成用户授权；只有部署者在这里
+   * 显式开启（视为部署者授权）才提供取回路径。
+   */
+  allowCredentialReveal?: boolean
+  /** T11（第五轮）：自定义敏感词（正则源串）。命中者出库即掩码（不做写侧拒绝），与固定凭据正则取并集 */
+  redactPatterns?: string[]
   /** 自动提取冷却毫秒数（默认 120 秒）：同一会话该窗口内不重复提取 */
   autoExtractCooldownMs?: number
 }
@@ -144,6 +152,8 @@ export const Config = z.object({
   autoExtractCooldownMs: z.number().default(120 * 1000),
   injectionBudgetChars: z.number().default(1200),
   importAllowRoots: z.array(z.string()).default([]),
+  allowCredentialReveal: z.boolean().default(false),
+  redactPatterns: z.array(z.string()).default([]),
 })
 
 
@@ -197,6 +207,14 @@ export function apply(ctx: Context, config: Config): void {
   const valueMaxChars = Math.max(120, config.valueMaxChars || 240)
   // m9：full 总长上限——修复前同一 key 反复超长更新会把原文一再追加进 full，无限膨胀
   const fullMaxChars = Math.max(1000, config.fullMaxChars || 8000)
+  // T10/T11（第五轮）：凭据揭示开关与自定义敏感词
+  const allowCredentialReveal = config.allowCredentialReveal === true
+  const redactPatterns = Array.isArray(config.redactPatterns)
+    ? config.redactPatterns.filter((pattern): pattern is string => typeof pattern === 'string' && pattern.trim() !== '')
+    : []
+  /** 出库掩码判定：固定凭据正则 ∪ 自定义敏感词 */
+  const shouldMaskOutbound = (key: string, value: string): boolean =>
+    isCredentialItem(key, value) || matchesRedactPattern(value, redactPatterns)
   // M12 容量守卫（v0.1.23）：条数无上限时，召回扫描与「整库重写」I/O 都随库线性劣化。
   // 默认 2000，可按需调小（小库/测试场景）；只挡「新增」——更新已有条目永远放行。
   const maxItems = Math.max(1, Math.floor(Number(config.maxItems) || 2000))
@@ -808,6 +826,12 @@ export function apply(ctx: Context, config: Config): void {
   // agentOptions 只有 provider/model），而子代理会话必然带 origin/parentSession/delegationDepth
   // （@deepseek-ai/dsh-subagent 的 childSessionMeta）。要求显式深度会把新鲜顶层会话误判为子代理。
   // 深度仍用 DSH 官方 delegationDepthOf（单调取大：header 权威，runtime options 只能加深）。
+  // T8（第五轮调查结论）：残留折中「{session:{id,header:{}},options:{}} 判为主会话」在生产**不可达作为子代理**——
+  // DSH 的子代理会话由 childSessionMeta 构造（packages/subagent/subagent/src/child-agent.ts:139-158），
+  // 必写 parentSession / origin:'subagent' / delegationDepth（注释标为 Durable，持久化后仍在），
+  // 而 packages/core/agent/src/runtime-types.ts:166 的 Agent.options 恒存在（字段全可选，缺失时不影响判定）。
+  // 顶层主会话的 header 只带 cwd/agentPreset，正是该形状 → 判主会话正确。收紧这条的代价是把所有新鲜顶层
+  // 主会话误判为子代理（写不了 global + 只读守则 + 提取器停摆），故保持现状并在此固化依据。
   function isSubagentAgent(agent: any): boolean {
     const session = agent?.session
     if (session === null || typeof session !== 'object') return true    // 拿不到会话 → 按子代理
@@ -1062,12 +1086,9 @@ export function apply(ctx: Context, config: Config): void {
               content: [{ type: 'text', text: guideText }],
               source: { kind: 'plugin', plugin: name, form: guideForm, summary: '记忆守则自动注入' },
             })
-            // 有界淘汰：只移除最旧一次注入记录，不整体清空（避免所有会话冷却状态丢失）
-            if (sessionInjections.size > 200) {
-              const oldest = sessionInjections.keys().next().value
-              if (oldest !== undefined) sessionInjections.delete(oldest)
-            }
-            sessionInjections.set(guideKey, Date.now())
+            // 有界淘汰（T4 修）：统一走 setBounded（先 set 再 while(size>max) 删最旧）——
+            // 旧写法「先判 size>200 再 set」的稳态是 201 条，上界失效 1 条
+            setBounded(sessionInjections, guideKey, Date.now())
             persistInjectionState()
             remainingBudget -= guideText.length
             changed = true
@@ -1107,11 +1128,7 @@ export function apply(ctx: Context, config: Config): void {
                 content: [{ type: 'text', text }],
                 source: { kind: 'plugin', plugin: name, form: 'memory-lesson', summary: `教训/规则提醒 ${lessonKept.length} 条` },
               })
-              if (sessionInjections.size > 200) {
-                const oldest = sessionInjections.keys().next().value
-                if (oldest !== undefined) sessionInjections.delete(oldest)
-              }
-              sessionInjections.set(lessonKey, Date.now())
+              setBounded(sessionInjections, lessonKey, Date.now())
               persistInjectionState()
               for (const item of lessonKept) lessonKeys.add(`${item.scope}/${item.key}`)
               changed = true
@@ -1169,12 +1186,7 @@ export function apply(ctx: Context, config: Config): void {
                     content: [{ type: 'text', text }],
                     source: { kind: 'plugin', plugin: name, form: 'memory-recall', summary: `记忆自动召回 ${recalledItems.length} 条` },
                   })
-                  // 有界淘汰：只移除最旧一次注入记录，不整体清空（避免所有会话冷却状态丢失）
-            if (sessionInjections.size > 200) {
-              const oldest = sessionInjections.keys().next().value
-              if (oldest !== undefined) sessionInjections.delete(oldest)
-            }
-                  sessionInjections.set(sid, Date.now())
+                  setBounded(sessionInjections, sid, Date.now())
                   persistInjectionState()
                   changed = true
                 }
@@ -1200,15 +1212,11 @@ export function apply(ctx: Context, config: Config): void {
                 content: [{ type: 'text', text }],
                 source: { kind: 'plugin', plugin: name, form: 'memory-index', summary: '记忆索引（未召回）' },
               })
-              if (sessionInjections.size > 200) {
-                const oldest = sessionInjections.keys().next().value
-                if (oldest !== undefined) sessionInjections.delete(oldest)
-              }
-              sessionInjections.set(idxKey, Date.now())
+              setBounded(sessionInjections, idxKey, Date.now())
               // v0.1.20 互斥：索引块与召回共用会话主键——首轮给过目录就不再补一次
               // 召回，避免同一会话叠两套重叠记忆（实测索引 424 + 召回 460 = 884 字）。
               // 需要具体内容时模型手上有 memory_search。
-              sessionInjections.set(sid, Date.now())
+              setBounded(sessionInjections, sid, Date.now())
               persistInjectionState()
               changed = true
             }
@@ -1456,12 +1464,14 @@ export function apply(ctx: Context, config: Config): void {
       const includeFull = args.includeFull === true
       // C7：凭据类记忆（auth.* 或 value 命中凭据正则）默认掩码——记忆原文会随工具返回
       // 进入会话上下文并外发至 LLM provider，明文凭据不应默认进入上下文
-      const reveal = args.confirmed === true
+      // T10（第五轮收口）：confirmed 只是模型自述，不构成用户授权——
+      // 默认即使 confirmed:true 也掩码；只有部署者显式 allowCredentialReveal:true 才开放取回路径
+      const reveal = allowCredentialReveal && args.confirmed === true
       return withLock(async () => {
         const items = await readItems()
         const item = items.find((entry) => entry.scope === scope && entry.key === key)
         if (!item) return { found: false, key, scope }
-        const masked = !reveal && isCredentialItem(item.key, item.value)
+        const masked = !reveal && shouldMaskOutbound(item.key, item.value)
         return {
           found: true,
           key,
@@ -1533,7 +1543,7 @@ export function apply(ctx: Context, config: Config): void {
           key: item.key,
           scope: item.scope,
           // C7：凭据类条目的 value 出库即掩码（含非 auth.* 但命中凭据正则的历史遗留条目）
-          value: isCredentialItem(item.key, item.value) ? maskCredential(item.value) : sanitizeValue(item.value),
+          value: shouldMaskOutbound(item.key, item.value) ? maskCredential(item.value) : sanitizeValue(item.value),
           tags: item.tags,
           updatedAt: item.updatedAt,
         })),
@@ -1670,13 +1680,18 @@ export function apply(ctx: Context, config: Config): void {
       const scopeFilter = args.scope ? normalizeScope(args.scope, defaultScope) : ''
       const maxItems = Math.max(1, Math.min(50, Number(args.maxItems) || 20))
       const apply = args.apply === true
-      // S1（对抗性复核，v0.1.24）：apply 会改写/归档库中条目——子代理只准维护自己的 scope，
-      // 与 memory_set/memory_forget 同源的硬层隔离。未传 scope 时归档遍历全部 scope（含 global）。
-      // exec 缺失 = 非 agent 发起的调用（命令路径/直接调用），与 memory_set 的 fromUser 同源豁免；
-      // 真实工具调用必带 exec（@deepseek-ai/dsh-tools 的 tool.execute(exec.arguments, exec)）。
-      if (apply && exec !== undefined && (scopeFilter === '' || scopeFilter === 'global') && isSubagentAgent(exec.agent)) {
-        const subId = String(exec?.agent?.session?.id ?? 'unknown')
-        throw new Error(`memory_dream: 子代理会话禁止归档 global 记忆；确需维护请显式传 scope=sub:${subId}（未传 scope 时归档会遍历全部 scope，含 global）`)
+      // S1（对抗性复核，v0.1.24）：apply 会改写/归档库中条目——子代理只准维护自己的 scope。
+      // T7（第五轮收口）：apply 是写操作，没有 exec 就无法确认调用方身份 → fail-closed 拒绝
+      // （此前「无 exec 即豁免」会让该形状直接归档 global，是已知攻击面）。
+      // 真实工具调用必带 exec；/memory dream 命令走的是另一条路径（只列候选、不写库）。
+      if (apply && (scopeFilter === '' || scopeFilter === 'global')) {
+        if (exec === undefined) {
+          throw new Error('memory_dream: apply 需要调用方身份（缺少 exec 且命令路径不支持 apply），拒绝归档。请通过工具调用并携带 exec')
+        }
+        if (isSubagentAgent(exec.agent)) {
+          const subId = String(exec?.agent?.session?.id ?? 'unknown')
+          throw new Error(`memory_dream: 子代理会话禁止归档 global 记忆；确需维护请显式传 scope=sub:${subId}（未传 scope 时归档会遍历全部 scope，含 global）`)
+        }
       }
       // M12：apply 要写库，整段必须走 withConflictRetry（读→改→写是一个原子序列）
       return withLock(() => withConflictRetry(async () => {
@@ -1759,13 +1774,19 @@ export function apply(ctx: Context, config: Config): void {
     scope: string,
     guard?: { exec?: any; fromUser?: boolean },
   ): Promise<{ imported: number; skipped: number; rejected: number; summary: string }> {
-    // S1（对抗性复核，v0.1.24）：越权写 global 的硬闸门，与 memory_set 同款。写入只在这一处，
-    // 工具入口把 exec 传下来。fromUser（/memory import，用户亲自输入即人）与「没有 exec」
-    // （命令路径/直接调用）豁免：那些路径拿不到 agent 信息，fail-closed 探测会一律判为子代理，
-    // 不能因此挡住人；真实工具调用必带 exec，子代理拿不到这条豁免。
-    if (!guard?.fromUser && guard?.exec !== undefined && scope === 'global' && isSubagentAgent(guard.exec.agent)) {
-      const subId = String(guard?.exec?.agent?.session?.id ?? 'unknown')
-      throw new Error(`memory_import: 子代理会话禁止写入 global 记忆；确需落地请用 scope=sub:${subId}，成果建议以结果报告回传父会话由父会话沉淀`)
+    // S1（对抗性复核，v0.1.24）：越权写 global 的硬闸门，与 memory_set 同款。写入只在这一处。
+    // T7（第五轮收口）：**移除**「没有 exec 即视为用户操作」的隐式放行——豁免只认显式 fromUser
+    // （/memory import 命令，用户亲自输入）。既非 fromUser 又拿不到 exec 的调用无法证明身份，
+    // 按 fail-closed 拒绝（此前该形状会静默放行 global 写入，是已知攻击面）。
+    // 真实工具调用必带 exec（dsh-tools 的 tool.execute(args, exec)），命令路径显式传 fromUser。
+    if (guard?.fromUser !== true) {
+      if (guard?.exec === undefined) {
+        throw new Error('memory_import: 无法确认调用方身份（缺少 exec 且未标记为用户亲自输入），拒绝导入；工具调用请携带 exec，命令路径请传 fromUser')
+      }
+      if (scope === 'global' && isSubagentAgent(guard.exec.agent)) {
+        const subId = String(guard?.exec?.agent?.session?.id ?? 'unknown')
+        throw new Error(`memory_import: 子代理会话禁止写入 global 记忆；确需落地请用 scope=sub:${subId}，成果建议以结果报告回传父会话由父会话沉淀`)
+      }
     }
     if (/^\\\\/.test(filePath)) {
       throw new Error('memory_import: 拒绝 \\\\?\\、UNC 与设备路径')

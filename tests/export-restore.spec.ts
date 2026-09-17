@@ -122,9 +122,9 @@ describe('M12 memory_dream apply 归档', () => {
     const seed = [{ id: 'o', key: 'ref.old-doc', value: longValue, scope: 'global', tags: [], createdAt: daysAgo(120), updatedAt: daysAgo(120) }]
     const { fake } = setup({}, seed)
     const dream = fake.toolDefs.get('memory_dream')
-    const before = await dream.execute({})
+    const before = await dream.execute({}, MAIN)
     expect(before.candidates.length).toBeGreaterThanOrEqual(1)
-    const applied = await dream.execute({ apply: true })
+    const applied = await dream.execute({ apply: true }, MAIN)
     expect(applied.summary).toMatch(/归档/)
     const get = fake.toolDefs.get('memory_get')
     const item = await get.execute({ key: 'ref.old-doc', includeFull: true }, MAIN)

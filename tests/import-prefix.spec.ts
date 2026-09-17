@@ -14,6 +14,7 @@ import { cleanTempDir, makeFakeCtx, makeTempDir } from './helpers'
 // m11：walk 无深度上限，5000+ 层嵌套 JSON 会抛 RangeError: Maximum call stack size exceeded。
 
 const tmpDirs: string[] = []
+const MAIN = { agent: { session: { id: 'main-1', header: { delegationDepth: 0 } }, options: { subagentDepth: 0 } } }
 function setup(config: Record<string, unknown> = {}) {
   const dir = makeTempDir()
   tmpDirs.push(dir)
@@ -90,7 +91,7 @@ describe('M7 导入根前缀必须在白名单内', () => {
     const { fake } = setup()
     const p = memFile(ws, 'memories.json', JSON.stringify({ prefs: { key: 'x', value: '初始值' } }))
     const imp = fake.toolDefs.get('memory_import')
-    const r = await imp.execute({ path: p, scope: 'my-project' })
+    const r = await imp.execute({ path: p, scope: 'my-project' }, MAIN)
     expect(r.imported).toBe(1)
     const get = fake.toolDefs.get('memory_get')
     expect((await get.execute({ key: 'ref.prefs.x', scope: 'my-project' })).found).toBe(true)
@@ -109,7 +110,7 @@ describe('M7 导入根前缀必须在白名单内', () => {
     const { fake } = setup()
     const p = memFile(ws, 'array.json', JSON.stringify([{ key: 'x', value: '数组根条目' }]))
     const imp = fake.toolDefs.get('memory_import')
-    const r = await imp.execute({ path: p, scope: 'my-project' })
+    const r = await imp.execute({ path: p, scope: 'my-project' }, MAIN)
     expect(r.imported).toBe(1)
     const set = fake.toolDefs.get('memory_set')
     const upd = await set.execute({ key: 'ref.0.x', value: '更新后的值', scope: 'my-project' })
@@ -170,7 +171,7 @@ describe('m10 slugKey 折叠：同一次导入内 key 唯一', () => {
       'a_b': { key: 'a_b', value: '第三个值' },
     }]))
     const imp = fake.toolDefs.get('memory_import')
-    const r = await imp.execute({ path: p, scope: 'my-project' })
+    const r = await imp.execute({ path: p, scope: 'my-project' }, MAIN)
     // m10 + 批内不去重：三个碰撞源键产出三个独立 key，全部真正落盘（修复前 1 新增 + 2 跳过）
     expect(r.imported).toBe(3)
     expect(r.skipped).toBe(0)

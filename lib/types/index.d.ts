@@ -27,7 +27,7 @@ export interface Config {
     autoRecallFallback?: boolean;
     /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
     autoCapture?: boolean;
-    /** 守则详略：brief（默认，约 210 字）| full（完整九类细则，约 3000 字） */
+    /** 守则详略：brief（默认，实测约 282 字，口径与 README 统一写「约 300 字」）| full（完整九类细则，约 3000 字） */
     autoCaptureDetail?: 'brief' | 'full';
     /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
     injectionBudgetChars?: number;
@@ -64,6 +64,14 @@ export interface Config {
     autoExtract?: boolean;
     /** memory_import 允许的根目录白名单；缺省为 [DSH_WORKSPACE]（无环境变量时拒绝导入） */
     importAllowRoots?: string[];
+    /**
+     * T10（第五轮）：是否允许通过 memory_get 的 confirmed:true 取回 auth.* 与凭据类记忆的原文。
+     * 默认 false —— confirmed 是模型自己填的 schema 参数，不构成用户授权；只有部署者在这里
+     * 显式开启（视为部署者授权）才提供取回路径。
+     */
+    allowCredentialReveal?: boolean;
+    /** T11（第五轮）：自定义敏感词（正则源串）。命中者出库即掩码（不做写侧拒绝），与固定凭据正则取并集 */
+    redactPatterns?: string[];
     /** 自动提取冷却毫秒数（默认 120 秒）：同一会话该窗口内不重复提取 */
     autoExtractCooldownMs?: number;
 }
@@ -98,6 +106,8 @@ export declare const Config: z<Schemastery.ObjectS<{
     autoExtractCooldownMs: z<number, number>;
     injectionBudgetChars: z<number, number>;
     importAllowRoots: z<string[], string[]>;
+    allowCredentialReveal: z<boolean, boolean>;
+    redactPatterns: z<string[], string[]>;
 }>, Schemastery.ObjectT<{
     dataDir: z<string, string>;
     defaultScope: z<string, string>;
@@ -129,5 +139,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     autoExtractCooldownMs: z<number, number>;
     injectionBudgetChars: z<number, number>;
     importAllowRoots: z<string[], string[]>;
+    allowCredentialReveal: z<boolean, boolean>;
+    redactPatterns: z<string[], string[]>;
 }>>;
 export declare function apply(ctx: Context, config: Config): void;

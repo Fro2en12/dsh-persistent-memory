@@ -82,7 +82,7 @@ describe('M14 /memory remember 复用写侧闸门', () => {
     const getTool = fake.toolDefs.get('memory_get')
     const g = await getTool.execute({ key: 'rule.long', includeFull: true }, MAIN)
     expect(g.found).toBe(true)
-    expect(g.value.length).toBeLessThanOrEqual(243)   // 240 + 省略号（输出面 NFKC 展开 … → ...）
+    expect(g.value.length).toBeLessThanOrEqual(242)   // 240 + 省略号（输出面 NFKC 展开 … → ...）
     expect(g.full).toBeTruthy()
   })
 

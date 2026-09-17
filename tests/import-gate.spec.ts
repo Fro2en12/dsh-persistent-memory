@@ -9,6 +9,7 @@ import { cleanTempDir, makeFakeCtx, makeTempDir } from './helpers'
 // M6：大小上限 2MB + 凭据闸门（命中整条丢弃）+ full 长度约束 + 默认 scope 改工作区
 
 const tmpDirs: string[] = []
+const MAIN = { agent: { session: { id: 'main-1', header: { delegationDepth: 0 } }, options: { subagentDepth: 0 } } }
 function setup(config: Record<string, unknown> = {}) {
   const dir = makeTempDir()
   tmpDirs.push(dir)
@@ -42,7 +43,7 @@ describe('C3 导入路径白名单', () => {
     const outsideFile = join(outside, 'secret.txt')
     writeFileSync(outsideFile, '# x\n\n内容', 'utf8')
     const tool = fake.toolDefs.get('memory_import')
-    await expect(tool.execute({ path: outsideFile })).rejects.toThrow(/只允许导入工作区内的文件/)
+    await expect(tool.execute({ path: outsideFile }, MAIN)).rejects.toThrow(/只允许导入工作区内的文件/)
   })
 
   it('工作区内文件可导入', async () => {
@@ -51,7 +52,7 @@ describe('C3 导入路径白名单', () => {
     const { fake } = setup()
     const p = memFile(ws, 'inside.md', '# 规则\n必须用 UTF8')
     const tool = fake.toolDefs.get('memory_import')
-    const r = await tool.execute({ path: p, scope: 'global' })
+    const r = await tool.execute({ path: p, scope: 'global' }, MAIN)
     expect(r.imported).toBe(1)
   })
 
@@ -65,14 +66,35 @@ describe('C3 导入路径白名单', () => {
     // Windows 免管理员：junction（目录链接）
     symlinkSync(outside, join(ws, 'link'), 'junction')
     const tool = fake.toolDefs.get('memory_import')
-    await expect(tool.execute({ path: join(ws, 'link', 'secret.md') })).rejects.toThrow(/只允许导入工作区内的文件/)
+    await expect(tool.execute({ path: join(ws, 'link', 'secret.md') }, MAIN)).rejects.toThrow(/只允许导入工作区内的文件/)
   })
 
   it('拒绝 UNC 路径', async () => {
     process.env.DSH_WORKSPACE = wsDir()
     const { fake } = setup()
     const tool = fake.toolDefs.get('memory_import')
-    await expect(tool.execute({ path: '\\\\server\\share\\x.md' })).rejects.toThrow(/UNC|设备路径/)
+    await expect(tool.execute({ path: '\\\\server\\share\\x.md' }, MAIN)).rejects.toThrow(/UNC|设备路径/)
+  })
+})
+
+describe('T7 调用方身份收口（第五轮）', () => {
+  it('既无 exec 又未标记 fromUser 的调用被拒绝（不再隐式豁免）', async () => {
+    const ws = wsDir()
+    process.env.DSH_WORKSPACE = ws
+    const { fake } = setup()
+    const p = memFile(ws, 'inside2.md', '# 规则\n必须用 UTF8')
+    const tool = fake.toolDefs.get('memory_import')
+    await expect(tool.execute({ path: p, scope: 'global' })).rejects.toThrow(/无法确认调用方身份|缺少 exec/)
+  })
+
+  it('/memory import 命令（fromUser）不受影响', async () => {
+    const ws = wsDir()
+    process.env.DSH_WORKSPACE = ws
+    const { fake } = setup()
+    const p = memFile(ws, 'inside3.md', '# 规则\n必须用 UTF8')
+    const cmd = fake.commandDefs.find((c: any) => c.name === 'memory')
+    const r = await cmd.handler({ rawInput: 'import ' + p })
+    expect(r.kind).toBe('success')
   })
 })
 
@@ -83,7 +105,7 @@ describe('M6 导入限制', () => {
     const { fake } = setup()
     const p = memFile(ws, 'big.md', '# 大文件\n\n' + 'a'.repeat(2 * 1024 * 1024 + 1))
     const tool = fake.toolDefs.get('memory_import')
-    await expect(tool.execute({ path: p })).rejects.toThrow(/字节上限/)
+    await expect(tool.execute({ path: p }, MAIN)).rejects.toThrow(/字节上限/)
   })
 
   it('含 PRIVATE KEY 的文件 imported:0（凭据闸门整条丢弃）', async () => {
@@ -92,7 +114,7 @@ describe('M6 导入限制', () => {
     const { fake } = setup()
     const p = memFile(ws, 'key.md', '# 密钥\n\n-----BEGIN PRIVATE KEY-----\nMIIabc123\n-----END PRIVATE KEY-----')
     const tool = fake.toolDefs.get('memory_import')
-    const r = await tool.execute({ path: p, scope: 'global' })
+    const r = await tool.execute({ path: p, scope: 'global' }, MAIN)
     expect(r.imported).toBe(0)
     expect(r.rejected).toBeGreaterThanOrEqual(1)
   })
@@ -103,7 +125,7 @@ describe('M6 导入限制', () => {
     const { fake } = setup()
     const p = memFile(ws, 'tok.md', '# env\nsk-1234567890abcdef')
     const tool = fake.toolDefs.get('memory_import')
-    const r = await tool.execute({ path: p, scope: 'global' })
+    const r = await tool.execute({ path: p, scope: 'global' }, MAIN)
     expect(r.imported).toBe(0)
     expect(r.rejected).toBeGreaterThanOrEqual(1)
   })
@@ -115,11 +137,11 @@ describe('M6 导入限制', () => {
     const long = 'x'.repeat(500)
     const p = memFile(ws, 'mem.json', JSON.stringify([{ key: 'ref.long', value: '摘要', full: long }]))
     const tool = fake.toolDefs.get('memory_import')
-    await tool.execute({ path: p, scope: 'global' })
+    await tool.execute({ path: p, scope: 'global' }, MAIN)
     const getTool = fake.toolDefs.get('memory_get')
     const g = await getTool.execute({ key: 'ref.0.ref-long', includeFull: true })
     expect(g.found).toBe(true)
-    expect(g.full.length).toBeLessThanOrEqual(243)   // 240 + 省略号（输出面 NFKC 将 … 展开为 ...）
+    expect(g.full.length).toBeLessThanOrEqual(242)   // 240 + 省略号（输出面 NFKC 将 … 展开为 ...）
   })
 
   it('导入默认 scope 为工作区 scope 而非 global', async () => {
@@ -129,7 +151,7 @@ describe('M6 导入限制', () => {
     const { fake } = setup()
     const p = memFile(ws, 'note.md', '# 注意\n这是个坑')
     const tool = fake.toolDefs.get('memory_import')
-    const r = await tool.execute({ path: p })
+    const r = await tool.execute({ path: p }, MAIN)
     expect(r.summary).toContain('my-project')
     const statsTool = fake.toolDefs.get('memory_stats')
     const s = await statsTool.execute({})

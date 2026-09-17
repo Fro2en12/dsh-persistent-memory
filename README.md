@@ -71,7 +71,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 ## 模型工具
 
 - `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）；库达 `maxItems`（默认 2000）后拒绝**新增**（更新已有 key 不受限），错误提示跑 `memory_dream`；`/memory restore` 作为救援通道不受此限
-- `memory_get` — 按 key 读取（`includeFull` 才返回完整正文）
+- `memory_get` — 按 key 读取（`includeFull` 才返回完整正文；凭据类条目默认掩码，需部署者 `allowCredentialReveal: true` 且带 `confirmed: true` 才可能取回原文）
 - `memory_search` — 关键词/标签/作用域搜索
 - `memory_forget` — 删除一条
 - `memory_stats` — 记忆库概况
@@ -125,6 +125,8 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
         taskTtlDays: 30             # task.* 保鲜期，超期在召回评分中降权
         fullMaxChars: 8000          # full 完整正文总长上限（默认 8000）：最新原文带时间戳置顶，不再尾部无限追加
         maxItems: 2000              # 写入容量守卫：达上限拒绝新增（更新不受限），提示跑 memory_dream
+        allowCredentialReveal: false # 是否允许 memory_get 用 confirmed:true 取回凭据类原文（默认 false：confirmed 是模型自述，不是用户授权）
+        redactPatterns: []          # 自定义敏感词（正则源串）：命中者出库即掩码（不做写侧拒绝），与固定凭据正则取并集
         approveOnSet: false         # 写入审批门（开启后须用户确认）
         dedupeOnSet: true           # 同 scope 高相似 key 自动合并
         synonymExpansion: true      # 同义词扩展评分
@@ -169,6 +171,7 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 | 教训通道 | 悔恨/场景信号强制召回 rule.*/lesson.*，独立 120s 冷却，不受 once 限制 |
 | 索引配额 | global 4 条（user.* 固定 2 席），工作区 scope 各 3 条 |
 | 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「守则+教训+召回+索引」共享；守则（静态文案）不受砍，剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
+| scope 归一 | `normalizeScope` 只做 trim + 小写（M8）；报告建议的「_`/`空格折叠为 `-`」**有意未做**——避免改写用户已有的 scope 命名（如 `my project`），README 与源码注释均记录该决策 |
 | 写侧闸门 | value ≤240 字、tags ≤3、前缀白名单九类 |
 | 写入容量 | `maxItems` 默认 2000：达上限拒绝新增（更新不受限），提示跑 `memory_dream`；`/memory restore` 救援通道不受限 |
 | full 归档 | `fullMaxChars` 默认 8000：同 key 反复超长更新时最新原文带时间戳置顶，旧内容保留在尾部但整体受上限约束，超限截断并警告 |
@@ -188,7 +191,8 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 ## 隐私与数据边界
 
 - **记忆内容会进入模型上下文**：`memory_get` / `memory_search` 返回的 `value` 与 `full` 作为工具结果进入会话上下文，并随该会话的请求发送至配置的 LLM provider（当前默认 provider 为 `deepseek-official`）；记忆库本身只落盘在本地 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`，插件不向其它服务发送记忆数据。
-- **自动注入通道已排除凭据**：`auth.*` 前缀条目，以及 `value` 命中凭据正则（token / secret / api key / bearer / sk- / ghp_ / AKIA / PRIVATE KEY / 中文口令）的条目，都不参与自动注入（召回 / 教训 / 索引；凭据类记忆只在模型显式 `memory_search` / `memory_get` 时返回）。模型显式调用时主会话仍可读到 `auth.*`；子代理会被硬层拒绝。
+- **自动注入通道已排除凭据**：`auth.*` 前缀条目，以及 `value` 命中凭据正则（token / secret / api key / bearer / sk- / ghp_ / AKIA / PRIVATE KEY / 中文口令）或命中 `redactPatterns` 自定义敏感词的条目，都不参与自动注入（召回 / 教训 / 索引；凭据类记忆只在模型显式 `memory_search` / `memory_get` 时返回）。模型显式调用时主会话读到的 `auth.*`/`凭据类条目`默认是**掩码**；子代理会被硬层拒绝。
+- **`confirmed` 是模型自述，不构成用户授权**：`memory_get` 的 `confirmed: true` 由模型自己填写，没有任何用户审批通道介入。因此默认配置下**即使带 `confirmed: true` 也只返回掩码**（`allowCredentialReveal` 默认 `false`）；只有部署者在 cordis 配置里显式写 `allowCredentialReveal: true`（视为部署者授权）才开放取回原文的路径。
 - **导出文件是明文**：`/memory export` 会把整库（含 `auth.*` 明文凭据与所有 `full` 正文）写入你指定的文件，仅本地落盘、插件不上传，但请自行保管该文件。
 - **`<memory-data trust="untrusted">` 是数据标注，不是脱敏**：工具输出中的记忆内容包裹在该标签内，并经 `sanitizeValue` 清洗（控制字符、危险 URI scheme、提示注入模式），但清洗不改变内容本身——不要把明文凭据写进非 `auth.*` 前缀，敏感内容入库前请自行判断。
 

@@ -4,6 +4,10 @@ import { contentSimilarity, keySimilarity } from './recall.js'
 
 /**
  * scope 归一（M8，v0.1.23）：trim + 统一小写。
+ *
+ * T12（第五轮核对）：审查报告 M8 的原文是「**建议**同时把 _/空格折叠为 -」（措辞为建议，非必须），
+ * 且折叠会改写用户已有的 scope 命名（如 "my project" → "my-project"），可能让既有条目的 scope
+ * 与用户心智/其它工具不一致；因此本轮**有意只做小写归一**，不折叠 _ 与空格。README 已同步说明。
  * 修复前只 trim：scope='Global' 既不是 'global'（索引分组失败）也不含小写工作区名，
  * 同一逻辑作用域裂成多个物理 scope（该条在索引中隐身、按 scope 精确检索查不到）。
  */
@@ -86,6 +90,23 @@ export function maskCredential(text: string): string {
   const m = text.match(/(sk-ant-|sk-proj-|sk_live_|sk_test_|github_pat_|glpat-|xox[abposr]-|npm_|sk-|ghp_|AKIA|ASIA|Bearer\s+|Basic\s+)/i)
   if (m) return `${m[1]}****（凭据已掩码，memory_get 带 confirmed:true 可取回原文）`
   return '****（凭据类记忆已掩码，memory_get 带 confirmed:true 可取回原文）'
+}
+
+/**
+ * T11（第五轮）：自定义敏感词匹配（config.redactPatterns）。与固定 CREDENTIAL_RE 取并集，
+ * 只作用于出库掩码，不做写侧拒绝——避免把正常内容误拒（用户可能确实要记录内部代号，只是不该外发）。
+ * 非法正则（用户手滑）被忽略，不影响其它模式。
+ */
+export function matchesRedactPattern(text: string, patterns: readonly string[]): boolean {
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string' || pattern.trim() === '') continue
+    try {
+      if (new RegExp(pattern, 'i').test(text)) return true
+    } catch {
+      // 非法正则：忽略该模式（调用方启动时会 warn）
+    }
+  }
+  return false
 }
 
 /** C7：该条目是否属于"默认掩码、需显式确认才返回原文"的类别 */

@@ -11,12 +11,12 @@ import { cleanTempDir, makeFakeCtx, makeTempDir } from './helpers'
 // auth.* 与疑似凭据内容做掩码，仅显式 confirmed:true 时返回原文。
 
 const tmpDirs: string[] = []
-function setup(seed?: unknown[]) {
+function setup(seed?: unknown[], config: Record<string, unknown> = {}) {
   const dir = makeTempDir()
   tmpDirs.push(dir)
   if (seed) writeFs(join(dir, 'memory.jsonl'), seed.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf8')
   const fake = makeFakeCtx()
-  apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: false })
+  apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: false, ...config })
   return { fake, dir }
 }
 afterEach(() => {
@@ -33,7 +33,7 @@ describe('C7 凭据掩码（工具出库面）', () => {
     expect(maskCredential(SECRET)).not.toContain('SuperSecret123')
   })
 
-  it('memory_get 读 auth.* 默认掩码，confirmed:true 才返回原文', async () => {
+  it('memory_get 读 auth.* 默认掩码', async () => {
     const { fake } = setup()
     const setTool = fake.toolDefs.get('memory_set')
     await setTool.execute({ key: 'auth.token', value: SECRET }, MAIN)
@@ -43,8 +43,57 @@ describe('C7 凭据掩码（工具出库面）', () => {
     expect(masked.value).not.toContain('SuperSecret123')
     expect(masked.value).toContain('掩码')
     expect(masked.full).toBeUndefined()
+  })
+
+  // T10（第五轮收口）：confirmed 是模型自己填的 schema 参数，不构成用户授权——
+  // 默认配置下即使 confirmed:true 也只回掩码；只有部署者显式开启 allowCredentialReveal 才可取回。
+  it('T10：默认配置下 confirmed:true 也不能取回 auth.* 原文（模型自述不等于授权）', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    await setTool.execute({ key: 'auth.token', value: SECRET }, MAIN)
+    const getTool = fake.toolDefs.get('memory_get')
+    const masked = await getTool.execute({ key: 'auth.token', includeFull: true, confirmed: true }, MAIN)
+    expect(masked.masked).toBe(true)
+    expect(masked.value).not.toContain('SuperSecret123')
+    expect(masked.full).toBeUndefined()
+  })
+
+  it('T10：显式 allowCredentialReveal:true（部署者授权）时 confirmed 可取回原文', async () => {
+    const { fake } = setup(undefined, { allowCredentialReveal: true })
+    const setTool = fake.toolDefs.get('memory_set')
+    await setTool.execute({ key: 'auth.token', value: SECRET }, MAIN)
+    const getTool = fake.toolDefs.get('memory_get')
     const revealed = await getTool.execute({ key: 'auth.token', includeFull: true, confirmed: true }, MAIN)
     expect(revealed.value).toBe(SECRET)
+    // 未带 confirmed 时仍然掩码
+    const stillMasked = await getTool.execute({ key: 'auth.token' }, MAIN)
+    expect(stillMasked.value).not.toContain('SuperSecret123')
+  })
+
+  // T11（第五轮补齐报告 C7 建议 3）：自定义敏感词（redactPatterns）与固定凭据正则取并集
+  it('T11：redactPatterns 命中的自定义敏感内容出库掩码（写侧不拒绝）', async () => {
+    const { fake } = setup(undefined, { redactPatterns: ['PROJECT-FALCON-9'] })
+    const setTool = fake.toolDefs.get('memory_set')
+    const writeResult = await setTool.execute({ key: 'project.codename', value: '内部代号 PROJECT-FALCON-9 的项目，时间 2026-09-17' }, MAIN)
+    expect(writeResult.ok).toBe(true)   // 写侧不拒绝：redactPatterns 是出库掩码而非写侧闸门
+    const getTool = fake.toolDefs.get('memory_get')
+    const g = await getTool.execute({ key: 'project.codename' }, MAIN)
+    expect(g.value).not.toContain('PROJECT-FALCON-9')
+    expect(g.value).toContain('掩码')
+    const searchTool = fake.toolDefs.get('memory_search')
+    const s = await searchTool.execute({ query: '内部代号' }, MAIN)
+    const hit = s.items.find((i: any) => i.key === 'project.codename')
+    expect(hit).toBeTruthy()
+    expect(hit.value).not.toContain('PROJECT-FALCON-9')
+  })
+
+  it('T11：未配置 redactPatterns 时普通内容不受影响；非法正则被忽略不抛错', async () => {
+    const { fake } = setup(undefined, { redactPatterns: ['[unclosed'] })   // 非法正则
+    const setTool = fake.toolDefs.get('memory_set')
+    await setTool.execute({ key: 'rule.normal', value: '普通内容 [unclosed 字样' }, MAIN)
+    const getTool = fake.toolDefs.get('memory_get')
+    const g = await getTool.execute({ key: 'rule.normal' }, MAIN)
+    expect(g.value).toContain('普通内容')
   })
 
   it('非 auth.* 的普通记忆不受掩码影响', async () => {
@@ -104,8 +153,10 @@ describe('S5 新增凭据形态的掩码', () => {
     }
   })
 
-  it('memory_get 对历史遗留的新形态条目默认掩码，confirmed:true 才返回原文', async () => {
-    const { fake, dir } = setup()
+  it('memory_get 对历史遗留的新形态条目默认掩码（T10 收口后 confirmed 默认无效，需部署者开启 allowCredentialReveal）', async () => {
+    // T10（第五轮）：confirmed 是模型自述，默认配置下即使 confirmed:true 也只回掩码；
+    // 本条改为在部署者显式授权（allowCredentialReveal:true）下验证取回路径。
+    const { fake, dir } = setup(undefined, { allowCredentialReveal: true })
     const now = '2026-09-17T00:00:00.000Z'
     const { appendFileSync } = await import('node:fs')
     for (const [i, secret] of S5_SECRETS.entries()) {
