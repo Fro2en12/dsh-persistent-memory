@@ -58,7 +58,7 @@ describe('M9 集成冒烟：apply + 工具注册', () => {
     const setTool = fake.toolDefs.get('memory_set')
     await setTool.execute({ key: 'rule.utf8', value: 'PowerShell 写中文加 -Encoding UTF8' }, exec)
     const searchTool = fake.toolDefs.get('memory_search')
-    const s = await searchTool.execute({ query: 'powershell' })
+    const s = await searchTool.execute({ query: 'powershell' }, exec)
     expect(s.count).toBe(1)
     expect(s.items[0].key).toBe('rule.utf8')
   })

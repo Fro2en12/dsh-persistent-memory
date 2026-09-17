@@ -120,7 +120,7 @@ describe('M1 工具级：stats.dropped 与降级守则', () => {
     const { fake, dir } = setupIntegration()
     writeFileSync(join(dir, 'memory.jsonl'), [DIRTY_NO_SCOPE, DIRTY_SCOPE_NUM, DIRTY_NO_VALUE, NORMAL].join('\n') + '\n', 'utf8')
     const searchTool = fake.toolDefs.get('memory_search')
-    const s = await searchTool.execute({ query: '正常' })
+    const s = await searchTool.execute({ query: '正常' }, { agent: { session: { id: 'main', header: { delegationDepth: 0 } }, options: { subagentDepth: 0 } } })
     expect(s.count).toBe(1)
     expect(s.items[0].key).toBe('rule.ok')
   })
