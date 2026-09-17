@@ -19,6 +19,7 @@ export interface FakeCtx {
   handlers: Map<string, any[]>
   routes: any[]
   settingsService: FakeSettingsService
+  logs: Array<{ level: string; message: string }>
 }
 
 /** 构造 apply() 所需的最小 fake ctx（不加载 cordis/dsh 运行时）；services 可注入 llm/sessionQuery 等 */
@@ -30,6 +31,16 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}, services: R
   const commandDefs: any[] = []
   const handlers = new Map<string, any[]>()
   const routes: any[] = []
+  const logs: Array<{ level: string; message: string }> = []
+  // 模拟 cordis logger 的 printf 插值（%s/%d/%o/%O/%i），让审计日志断言可验证
+  const formatLog = (message: unknown, args: unknown[]): string => {
+    let i = 0
+    return String(message).replace(/%[sdioO]/g, () => {
+      const a = args[i++]
+      if (a === undefined) return ''
+      return (a !== null && typeof a === 'object') ? JSON.stringify(a) : String(a)
+    })
+  }
 
   const settingsService: FakeSettingsService = {
     register(ns, _schema, opts) {
@@ -75,10 +86,14 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}, services: R
       return () => {}
     },
     get: (svc: string) => services[svc],
-    logger: { debug: () => {}, warn: () => {}, info: () => {} },
+    logger: {
+      debug: (message: unknown, ...args: unknown[]) => { logs.push({ level: 'debug', message: formatLog(message, args) }) },
+      warn: (message: unknown, ...args: unknown[]) => { logs.push({ level: 'warn', message: formatLog(message, args) }) },
+      info: (message: unknown, ...args: unknown[]) => { logs.push({ level: 'info', message: formatLog(message, args) }) },
+    },
     settings: settingsService,
   }
-  return { ctx, state, watchers, toolDefs, commandDefs, handlers, routes, settingsService }
+  return { ctx, state, watchers, toolDefs, commandDefs, handlers, routes, settingsService, logs }
 }
 
 /** 每个用例独立的临时 dataDir，测试结束清理 */
