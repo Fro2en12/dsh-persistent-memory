@@ -1782,12 +1782,63 @@ export function apply(ctx: Context, config: Config): void {
         res.writeHead(status)
         res.end(bytes)
       }
-      const handler = async (req: { method?: string; socket?: { remoteAddress?: string } }, res: unknown) => {
+      // C2 信任围栏（v0.1.23）：remoteAddress 本机 + Host 白名单（防 DNS rebinding）+
+      // Sec-Fetch-Site/Origin 校验（防 CSRF）+ 强制 JSON Content-Type（逼跨源进 preflight）。
+      const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost'])
+      const headerOf = (req: any, name: string): string => {
+        const v = req?.headers?.[name] ?? req?.headers?.[name.toLowerCase()]
+        return Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '')
+      }
+      const hostnameOf = (host: string): string => {
+        const m = /^\[([^\]]+)\](?::\d+)?$/.exec(host.trim())
+        if (m) return m[1].toLowerCase()
+        return host.trim().split(':')[0].toLowerCase()
+      }
+      const handler = async (req: any, res: unknown) => {
         const rr = res as { setHeader: (a: string, b: string) => void; writeHead: (n: number) => void; end: (d: unknown) => void }
         const remote = String(req.socket?.remoteAddress ?? '')
         if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
           respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'dsh-persistent-memory settings route is localhost-only' } })
           return
+        }
+        // 长期路径：与 /api 共用 DSH 官方信任围栏（connection.requestRejection，isTrustedApiRequest）
+        try {
+          const conn = ctx.get('connection') as { requestRejection?: (r: unknown) => unknown } | undefined
+          if (conn?.requestRejection?.(req)) {
+            respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'rejected by connection trust fence' } })
+            return
+          }
+        } catch { /* 无 connection 服务时继续本地围栏 */ }
+        // Host 围栏（防 DNS rebinding 读取与写入）
+        const host = headerOf(req, 'host')
+        if (!host || !LOOPBACK_HOSTS.has(hostnameOf(host))) {
+          respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'host must be 127.0.0.1 / [::1] / localhost' } })
+          return
+        }
+        // Sec-Fetch-Site / Origin 围栏（防 CSRF 盲写与跨站读取）
+        if (headerOf(req, 'sec-fetch-site').toLowerCase() === 'cross-site') {
+          respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'cross-site requests are not allowed' } })
+          return
+        }
+        const origin = headerOf(req, 'origin')
+        if (origin) {
+          let originUrl: URL
+          try { originUrl = new URL(origin) } catch {
+            respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'invalid origin' } })
+            return
+          }
+          if (!LOOPBACK_HOSTS.has(hostnameOf(originUrl.host)) || originUrl.host !== host) {
+            respond(rr, 403, { ok: false, error: { code: 'forbidden', message: 'origin must match the local authority' } })
+            return
+          }
+        }
+        if (req.method === 'POST') {
+          // 强制 JSON Content-Type：所有跨源请求都带非 JSON 类型 → 必须走 preflight 被 CORS 拒绝
+          const ct = headerOf(req, 'content-type')
+          if (!/^application\/json/.test(ct)) {
+            respond(rr, 415, { ok: false, error: { code: 'unsupported-media-type', message: 'application/json required' } })
+            return
+          }
         }
         if (req.method === 'GET') {
           try {
