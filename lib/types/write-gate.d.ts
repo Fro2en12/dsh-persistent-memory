@@ -8,17 +8,27 @@ export declare function normalizeScope(scope: string | undefined, defaultScope: 
 /** key 前缀白名单硬校验：与守则文本同源（KEY_PREFIX_LIST） */
 export declare function validateKeyPrefix(key: string, scope: string): void;
 /**
- * M2 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
- * 覆盖：弱关键词（token/secret/api key/password）、可识别形态
- * （bearer 长串、sk-/ghp_/AKIA、BEGIN PRIVATE KEY 块）与中文口令词。
+ * M2/S5 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
+ * 覆盖：弱关键词（token/secret/api key/access key/AccountKey/password/中文口令）、
+ * 授权头（Bearer 长串 / Authorization: Basic|Bearer|Token <base64>）、常见厂商前缀
+ * （sk-/sk-ant-/sk-proj-/sk_live_/ghp_/github_pat_/glpat-/xox./npm_/AKIA/ASIA）、
+ * JWT、带账号密码的连接串、PRIVATE KEY 块。
+ * 无任何前缀的长令牌（AWS secret、私钥体、自定义 API key…）由 findHighEntropyCredential 兜底。
  */
 export declare const CREDENTIAL_RE: RegExp;
-/** 返回命中的凭据片段（未命中 null） */
+/**
+ * S5 高熵兜底：没有任何已知前缀的长令牌（AWS secret、私钥体、自定义 API key…）。
+ * 判定（长度 ≥32 且满足其一）：① 同时含大写、小写与数字；② base64 形态且大小写混排
+ * 并含 +/= 或数字；③ hex 形态。只作用于 value 的凭据判定——中文正文、普通句子、
+ * URL、路径与长驼峰标识都不含这样的连续令牌段，不会误判（见 S5_SAFE 反例用例）。
+ */
+export declare function findHighEntropyCredential(text: string): string | null;
+/** 返回命中的凭据片段（未命中 null）：先已知形态，再高熵兜底 */
 export declare function findCredentialMatch(body: string): string | null;
 /**
  * C7：凭据掩码（工具出库面用）。记忆原文会随工具返回进入会话上下文并外发至
  * 配置的 LLM provider——auth.* 与命中凭据正则的条目默认只回掩码，保留可识别
- * 前缀（sk-/ghp_/AKIA/Bearer）以便用户知道"这里有一条什么凭据记忆"。
+ * 前缀（sk-/ghp_/AKIA/Bearer/xox./glpat-/…）以便用户知道"这里有一条什么凭据记忆"。
  */
 export declare function maskCredential(text: string): string;
 /** C7：该条目是否属于"默认掩码、需显式确认才返回原文"的类别 */

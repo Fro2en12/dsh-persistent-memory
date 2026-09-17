@@ -21,25 +21,69 @@ export function validateKeyPrefix(key: string, scope: string): void {
 }
 
 /**
- * M2 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
- * 覆盖：弱关键词（token/secret/api key/password）、可识别形态
- * （bearer 长串、sk-/ghp_/AKIA、BEGIN PRIVATE KEY 块）与中文口令词。
+ * M2/S5 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
+ * 覆盖：弱关键词（token/secret/api key/access key/AccountKey/password/中文口令）、
+ * 授权头（Bearer 长串 / Authorization: Basic|Bearer|Token <base64>）、常见厂商前缀
+ * （sk-/sk-ant-/sk-proj-/sk_live_/ghp_/github_pat_/glpat-/xox./npm_/AKIA/ASIA）、
+ * JWT、带账号密码的连接串、PRIVATE KEY 块。
+ * 无任何前缀的长令牌（AWS secret、私钥体、自定义 API key…）由 findHighEntropyCredential 兜底。
  */
-export const CREDENTIAL_RE = /token|secret|api[_-]?key|bearer\s+\S{16,}|sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BEGIN .*PRIVATE KEY|password|passwd|密码|口令|密钥/i
+export const CREDENTIAL_RE = /token|secret|api[_-]?key|access[_-]?key|accountkey|password|passwd|密码|口令|密钥|bearer\s+\S{16,}|(?:authorization|proxy-authorization)\s*:\s*(?:basic|bearer|token)\s+[A-Za-z0-9+/=_.-]{12,}|\bbasic\s+[A-Za-z0-9+/=]{16,}|\bsk-[A-Za-z0-9]{16,}|\bsk-ant-[A-Za-z0-9_-]{16,}|\bsk-proj-[A-Za-z0-9_-]{16,}|\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}|\bghp_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bglpat-[A-Za-z0-9_-]{16,}|\bxox[abposr]-[A-Za-z0-9-]{10,}|\bnpm_[A-Za-z0-9]{30,}|\bAKIA[0-9A-Z]{16}|\bASIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|BEGIN[ A-Z]*PRIVATE KEY|(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|mssql|sqlserver|ftp|sftp|smtp|ldap):\/\/[^\s:@\/]+:[^\s@\/]+@/i
 
-/** 返回命中的凭据片段（未命中 null） */
+/** 高熵令牌候选：连续 ≥32 个令牌字符（不含空格/点/冒号，URL 与路径不会被整段吞进来） */
+const ENTROPY_CANDIDATE_RE = /[A-Za-z0-9+/=_-]{32,}/g
+/** base64 形态（标准字母表，允许尾部 = 填充） */
+const BASE64_SHAPE_RE = /^[A-Za-z0-9+/]+={0,2}$/
+/** hex 形态（md5/sha/无前缀 hex token） */
+const HEX_SHAPE_RE = /^[0-9a-f]+$/i
+
+/** URL/路径形态（com/foo/bar-baz、E:/Work/proj2/src/index）是正常长文本，不是凭据。
+ *  判定收紧到两类：① 首段是 TLD 形态（URL 残段）；② ≥4 段文件路径。
+ *  这样 40 字符的 AWS secret（wJalr…/K7MDENG/bPxRfi…，3 段且首段非全小写）不会被豁免。 */
+function looksLikePathOrUrl(token: string): boolean {
+  const trimmed = token.replace(/^[.\/\\]+/, '')
+  const segments = trimmed.split('/')
+  if (segments.length < 3) return false
+  if (!segments.every((seg) => /^[A-Za-z0-9._-]+$/.test(seg))) return false
+  if (/^[a-z]{2,10}$/.test(segments[0])) return true
+  return segments.length >= 4
+}
+
+/**
+ * S5 高熵兜底：没有任何已知前缀的长令牌（AWS secret、私钥体、自定义 API key…）。
+ * 判定（长度 ≥32 且满足其一）：① 同时含大写、小写与数字；② base64 形态且大小写混排
+ * 并含 +/= 或数字；③ hex 形态。只作用于 value 的凭据判定——中文正文、普通句子、
+ * URL、路径与长驼峰标识都不含这样的连续令牌段，不会误判（见 S5_SAFE 反例用例）。
+ */
+export function findHighEntropyCredential(text: string): string | null {
+  const candidates = text.match(ENTROPY_CANDIDATE_RE)
+  if (!candidates) return null
+  for (const token of candidates) {
+    if (token.length < 32 || looksLikePathOrUrl(token)) continue
+    const hasUpper = /[A-Z]/.test(token)
+    const hasLower = /[a-z]/.test(token)
+    const hasDigit = /[0-9]/.test(token)
+    if (hasUpper && hasLower && hasDigit) return token
+    if (BASE64_SHAPE_RE.test(token) && hasUpper && hasLower && (/[+/=]/.test(token) || hasDigit)) return token
+    if (HEX_SHAPE_RE.test(token) && hasDigit) return token
+  }
+  return null
+}
+
+/** 返回命中的凭据片段（未命中 null）：先已知形态，再高熵兜底 */
 export function findCredentialMatch(body: string): string | null {
   const m = body.match(CREDENTIAL_RE)
-  return m ? m[0] : null
+  if (m) return m[0]
+  return findHighEntropyCredential(body)
 }
 
 /**
  * C7：凭据掩码（工具出库面用）。记忆原文会随工具返回进入会话上下文并外发至
  * 配置的 LLM provider——auth.* 与命中凭据正则的条目默认只回掩码，保留可识别
- * 前缀（sk-/ghp_/AKIA/Bearer）以便用户知道"这里有一条什么凭据记忆"。
+ * 前缀（sk-/ghp_/AKIA/Bearer/xox./glpat-/…）以便用户知道"这里有一条什么凭据记忆"。
  */
 export function maskCredential(text: string): string {
-  const m = text.match(/(sk-|ghp_|AKIA|Bearer\s+)/i)
+  const m = text.match(/(sk-ant-|sk-proj-|sk_live_|sk_test_|github_pat_|glpat-|xox[abposr]-|npm_|sk-|ghp_|AKIA|ASIA|Bearer\s+|Basic\s+)/i)
   if (m) return `${m[1]}****（凭据已掩码，memory_get 带 confirmed:true 可取回原文）`
   return '****（凭据类记忆已掩码，memory_get 带 confirmed:true 可取回原文）'
 }

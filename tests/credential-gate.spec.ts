@@ -120,3 +120,65 @@ describe('M2 出库侧兜底 excludeCredentials', () => {
     expect(findPluginMessages(d, 'memory-index')).toHaveLength(0)
   })
 })
+
+// ── S5（复核实测 15 类形态中 14 类漏检）：补齐常见前缀/形态 + 高熵兜底 ──────
+const S5_FORMS: Array<[string, string]> = [
+  ['wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'AWS secret（无 AKIA 前缀）'],
+  ['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c', 'JWT（eyJ…）'],
+  ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj', '私钥体（无 BEGIN 头）'],
+  ['postgres://user:s3cretpw@db.example.com:5432/app', 'postgres 连接串'],
+  ['xoxb-123456789012-abcdefghijklmnopqrstuvwx', 'Slack xoxb-'],
+  ['sk_live_51H8xYzABCdefGHIJKLmnopqrstuv', 'Stripe sk_live_'],
+  ['github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz0123456789ABCDEF', 'GitHub github_pat_'],
+  ['glpat-abcdefghijklmnopqrst', 'GitLab glpat-'],
+  ['npm_abcdefghijklmnopqrstuvwxyz0123456789', 'npm_ 令牌'],
+  ['AccountKey=abcdefghijklmnopqrstuvwxyz0123456789==', 'Azure AccountKey='],
+  ['Authorization: Basic dXNlcjpwYXNzd29yZA==', 'Authorization: Basic'],
+  ['sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789', 'Anthropic sk-ant-api03-'],
+  ['Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lm', '无前缀高熵令牌（≥32 且含大小写与数字）'],
+  ['a3f1c9e7b5d24680ace13579bdf02468ace13579', 'hex 形态令牌'],
+]
+
+// 反向用例：普通长文本（中文正文/英文句子/URL/路径/长驼峰标识）不得判为凭据
+const S5_SAFE = [
+  'PowerShell 写中文加 -Encoding UTF8',
+  '本项目约定：提交前先跑 pnpm test，失败必须先修复再提交，不允许跳过用例',
+  '在 Windows 上用 pwsh -NoProfile 执行构建脚本，输出用 UTF8 编码避免中文乱码',
+  '仓库地址 https://github.com/Fro2en12/dsh-persistent-memory 里有完整说明',
+  '项目路径 E:/Work/persistent-memory-project2/src/index.ts 已经固定',
+  'Remember to run the full test suite before every release and fix any failing case first',
+  'PowerShellScriptWithLongCamelCaseName',
+]
+
+describe('S5 凭据形态补齐（write-gate）', () => {
+  it('复核列出的每类形态都命中 findCredentialMatch', () => {
+    for (const [form, label] of S5_FORMS) {
+      expect(findCredentialMatch(form), '未命中: ' + label + ' = ' + form).not.toBeNull()
+    }
+  })
+
+  it('普通长文本不误判（中文正文 / 英文句子 / URL / 路径 / 长驼峰标识）', () => {
+    for (const text of S5_SAFE) {
+      expect(findCredentialMatch(text), '误判为凭据: ' + text).toBeNull()
+    }
+  })
+})
+
+describe('S5 memory_set 凭据拒绝 / 普通长文本放行', () => {
+  it('每类形态在非 auth.* 前缀下都被拒绝', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    for (const [form, label] of S5_FORMS) {
+      await expect(setTool.execute({ key: 'env.probe', value: form }, MAIN), '未拒绝: ' + label).rejects.toThrow(/明文凭据|凭据类记忆/)
+    }
+  })
+
+  it('普通长文本仍可写入（不被放大的规则误拒）', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    for (const [i, text] of S5_SAFE.entries()) {
+      const r = await setTool.execute({ key: 'rule.safe' + i, value: text }, MAIN)
+      expect(r.ok, '被误拒: ' + text).toBe(true)
+    }
+  })
+})
