@@ -197,7 +197,6 @@ export function apply(ctx: Context, config: Config): void {
     stat: (p) => fs.stat(p),
     readFile: (p) => fs.readFile(p, 'utf8'),
     mkdir: (p, o) => fs.mkdir(p, o),
-    writeFile: (p, b) => fs.writeFile(p, b, 'utf8'),
     open: (p, f) => fs.open(p, f).then((fh) => fh as unknown as StoreFileHandle),
     rename: (a, b) => fs.rename(a, b),
     copyFile: (a, b) => fs.copyFile(a, b),
