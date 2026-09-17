@@ -38,6 +38,8 @@ export interface MemoryStore {
   readItems(): Promise<MemoryItem[]>
   writeItems(items: MemoryItem[]): Promise<void>
   invalidateCache(): void
+  /** 最近一次读盘时被丢弃的坏行数（M1） */
+  getDropped(): number
 }
 
 /**
@@ -52,7 +54,10 @@ export interface MemoryStore {
 export function createStore(opts: StoreOptions): MemoryStore {
   let itemsCache: { mtimeMs: number; size: number; items: MemoryItem[] } | null = null
   let warnedZeroBak = false
+  let dropped = 0
   const bakFile = opts.dataFile + '.bak'
+  const makeId = opts.makeId ?? (() => 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10))
+  const nowIso = opts.now ?? (() => new Date().toISOString())
 
   async function readItems(): Promise<MemoryItem[]> {
     let st: StoreFsStat
@@ -88,15 +93,31 @@ export function createStore(opts: StoreOptions): MemoryStore {
       const trimmed = line.trim()
       if (!trimmed) continue
       try {
-        const parsed = JSON.parse(trimmed) as MemoryItem
-        // 兼容历史/手工写入的缺字段记录：tags 缺失会令下游 item.tags.includes/map 抛 TypeError，
-        // 进而使整个自动召回被外层 catch 静默吞掉（违背"忽略损坏行防崩溃"目标）。
-        if (parsed && typeof parsed.key === 'string') {
-          if (!Array.isArray(parsed.tags)) parsed.tags = []
-          items.push(parsed)
-        }
+        const parsed = JSON.parse(trimmed) as Partial<MemoryItem>
+        // M1 行级规范化：一行不合法只丢一行并计数——修复前单条缺 scope 脏行
+        // 会让 scoreItem 的 item.scope.toLowerCase() 崩掉整条召回链（守则/教训/召回/索引全停）。
+        // 口径：key/value 必须为 string、scope 缺省/非 string、tags 非数组 → 坏行 dropped++；
+        // 空白 scope 补 defaultScope；id/时间戳缺失补默认；links/tags 过滤非字符串元素。
+        if (!parsed || typeof parsed.key !== 'string' || !parsed.key.trim()) { dropped++; continue }
+        if (typeof parsed.value !== 'string') { dropped++; continue }
+        if (parsed.scope === undefined) { dropped++; continue }
+        if (typeof parsed.scope !== 'string') { dropped++; continue }
+        if (parsed.tags !== undefined && !Array.isArray(parsed.tags)) { dropped++; continue }
+        const scope = parsed.scope.trim() ? parsed.scope.trim() : opts.defaultScope
+        items.push({
+          id: typeof parsed.id === 'string' && parsed.id ? parsed.id : makeId(),
+          key: parsed.key,
+          value: parsed.value,
+          scope,
+          tags: Array.isArray(parsed.tags) ? parsed.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+          createdAt: typeof parsed.createdAt === 'string' && parsed.createdAt ? parsed.createdAt : nowIso(),
+          updatedAt: typeof parsed.updatedAt === 'string' && parsed.updatedAt ? parsed.updatedAt : nowIso(),
+          ...(typeof parsed.full === 'string' ? { full: parsed.full } : {}),
+          ...(Array.isArray(parsed.links) ? { links: parsed.links.filter((link): link is string => typeof link === 'string') } : {}),
+          ...(typeof parsed.source === 'string' ? { source: parsed.source } : {}),
+        })
       } catch {
-        // 忽略损坏行，保证插件不因单条坏数据崩溃
+        dropped++
       }
     }
     itemsCache = { mtimeMs: st.mtimeMs, size: st.size, items }
@@ -136,5 +157,5 @@ export function createStore(opts: StoreOptions): MemoryStore {
     itemsCache = { mtimeMs: st.mtimeMs, size: st.size, items: items.slice() }
   }
 
-  return { readItems, writeItems, invalidateCache }
+  return { readItems, writeItems, invalidateCache, getDropped: () => dropped }
 }

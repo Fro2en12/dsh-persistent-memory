@@ -201,7 +201,7 @@ export function apply(ctx: Context, config: Config): void {
     rename: (a, b) => fs.rename(a, b),
     copyFile: (a, b) => fs.copyFile(a, b),
   }
-  const store = createStore({ fs: storeFs, dataDir, dataFile, defaultScope })
+  const store = createStore({ fs: storeFs, dataDir, dataFile, defaultScope, makeId, now: () => new Date().toISOString() })
   const readItems = (): Promise<MemoryItem[]> => store.readItems()
   const writeItems = (items: MemoryItem[]): Promise<void> => store.writeItems(items)
 
@@ -866,14 +866,17 @@ export function apply(ctx: Context, config: Config): void {
       next: () => Promise<any>,
     ): Promise<any> => {
       const decision = await next()
+      const sid = String(
+        payload.agent?.session?.id ?? payload.agent?.session?.sessionId ?? 'default',
+      )
+      const claimed = payload.messages as unknown[]
+      const entered: unknown[] = Array.isArray(decision?.messages) ? [...(decision.messages as unknown[])] : []
+      const lastClaimedIndex = entered.findLastIndex((item) => claimed.includes(item))
+      let changed = false
       try {
         if (decision?.kind === 'reject') return decision
         if (payload.signal?.aborted) return decision
         if (payload.step === 1 && (!Array.isArray(decision.messages) || decision.messages.length === 0)) return decision
-
-        const sid = String(
-          payload.agent?.session?.id ?? payload.agent?.session?.sessionId ?? 'default',
-        )
         if (payload.step === 1) {
           const header = payload.agent?.session?.header ?? payload.agent?.session
           ctx.logger.debug('[mem] agent probe %o', {
@@ -885,10 +888,6 @@ export function apply(ctx: Context, config: Config): void {
             id: payload.agent?.session?.id,
           })
         }
-        const claimed = payload.messages as unknown[]
-        const entered = [...(decision.messages as unknown[])]
-        const lastClaimedIndex = entered.findLastIndex((item) => claimed.includes(item))
-        let changed = false
 
         // ① 记忆守则：每会话首轮注入一次（独立 form，与召回分开去重）
         if (runtime.autoCapture && payload.step === 1) {
@@ -1052,6 +1051,28 @@ export function apply(ctx: Context, config: Config): void {
         return decision
       } catch (error) {
         ctx.logger.warn(`dsh-persistent-memory: auto injection failed: %o`, error)
+        // M1：注入链被坏数据/故障打断时不再整体静默——降级为仅注入守则（守则是静态文案，不受库数据影响）
+        if (changed) return { kind: 'enter', messages: entered }
+        try {
+          if (runtime.autoCapture && payload.step === 1 && decision && Array.isArray(decision.messages)) {
+            const guideKey = `${sid}:capture-guide`
+            const guideForm = isSubagentAgent(payload.agent) ? 'memory-capture-guide-subagent' : AUTO_CAPTURE_FORM
+            if (!sessionInjections.has(guideKey)) {
+              const guideText = isSubagentAgent(payload.agent)
+                ? SUBAGENT_CAPTURE_TEXT
+                : (autoCaptureDetail === 'full' ? AUTO_CAPTURE_TEXT : AUTO_CAPTURE_BRIEF_TEXT)
+              entered.splice(lastClaimedIndex + 1, 0, {
+                role: 'user',
+                id: makeId(),
+                content: [{ type: 'text', text: guideText }],
+                source: { kind: 'plugin', plugin: name, form: guideForm, summary: '记忆守则自动注入' },
+              })
+              sessionInjections.set(guideKey, Date.now())
+              persistInjectionState()
+              return { kind: 'enter', messages: entered }
+            }
+          }
+        } catch { /* 降级失败则维持原 decision */ }
         return decision
       }
     })
@@ -1325,11 +1346,13 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           total: { type: 'number', required: true },
           scopes: { type: 'object', required: true, additionalProperties: true },
+          dropped: { type: 'number' },
         },
       },
       render: (_args, value) => {
         const scopes = Object.entries(value.scopes || {}).map(([scope, count]) => `- ${scope}: ${count}`).join('\n')
-        return [{ type: 'text', text: `记忆库共 ${value.total} 条：\n${scopes}` }]
+        const droppedNote = value.dropped ? `\n（另有 ${value.dropped} 条损坏行在读取时被跳过）` : ''
+        return [{ type: 'text', text: `记忆库共 ${value.total} 条：\n${scopes}${droppedNote}` }]
       },
     },
     async execute() {
@@ -1337,7 +1360,7 @@ export function apply(ctx: Context, config: Config): void {
         const items = await readItems()
         const scopes: Record<string, number> = {}
         for (const item of items) scopes[item.scope] = (scopes[item.scope] || 0) + 1
-        return { total: items.length, scopes }
+        return { total: items.length, scopes, dropped: store.getDropped() }
       })
     },
   })), '@dsh-external/dsh-persistent-memory: memory_stats')

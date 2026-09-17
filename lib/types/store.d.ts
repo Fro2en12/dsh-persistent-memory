@@ -35,6 +35,8 @@ export interface MemoryStore {
     readItems(): Promise<MemoryItem[]>;
     writeItems(items: MemoryItem[]): Promise<void>;
     invalidateCache(): void;
+    /** 最近一次读盘时被丢弃的坏行数（M1） */
+    getDropped(): number;
 }
 /**
  * 记忆库读写实现（fs 可注入）。
