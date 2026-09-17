@@ -409,8 +409,8 @@ describe('M9 sanitizeValue 路径与 URL 回归', () => {
 
   it('盘符路径 E:/ 与 D:\\ 原样保留（重要回归点）', () => {
     expect(sanitizeValue('E:/dsh/workspace/memory.jsonl')).toBe('E:/dsh/workspace/memory.jsonl')
-    expect(sanitizeValue('D:\\改着玩\\dsh-persistent-memory\\src\\index.ts')).toBe('D:\\改着玩\\dsh-persistent-memory\\src\\index.ts')
-    expect(sanitizeValue('dataDir=D:\\改着玩\\dsh-persistent-memory 且 E:/tmp/x')).toBe('dataDir=D:\\改着玩\\dsh-persistent-memory 且 E:/tmp/x')
+    expect(sanitizeValue('D:\\work\\dsh-persistent-memory\\src\\index.ts')).toBe('D:\\work\\dsh-persistent-memory\\src\\index.ts')
+    expect(sanitizeValue('dataDir=D:\\work\\dsh-persistent-memory 且 E:/tmp/x')).toBe('dataDir=D:\\work\\dsh-persistent-memory 且 E:/tmp/x')
     expect(sanitizeValue('E:/a/b')).not.toContain('\u02d0')
   })
 
