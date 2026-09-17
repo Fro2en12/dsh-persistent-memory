@@ -4,7 +4,7 @@
 
 English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic recall. A nine-type memory taxonomy drives automatic capture guidance and a write-side gate; recall combines lexical scoring, zero-token RRF hybrid ranking, and LLM reranking; plus a lesson channel, memory metabolism, one-click import from Claude Code memory files, historical-session recall, and a settings panel.
 
-> **兼容性**：本版本对齐 DSH `0.1.2-alpha` —— 工具注册走官方 `defineTool`、设置面板走官方 `ctx.settings.register` + `settings.section` slot、会话检索走 `ctx.get('sessionQuery')` 接缝（可选，缺失时工具报错降级）。数据落盘 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`，重启不丢。
+> **兼容性**：本版本对齐 DSH `0.1.2-alpha` —— 工具注册走官方 `defineTool`、设置面板走官方 `ctx.settings.register` + `settings.section` slot、会话检索走 `ctx.get('sessionQuery')` 接缝（可选，缺失时工具报错降级）。数据落盘 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`（JSONL 存储，首行为 `{"__schema":1}` 哨兵，标记存储格式版本、供后续迁移识别），重启不丢。
 
 ## ⚠️ AI 产物声明
 
@@ -46,39 +46,39 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 
 | 机制 | 说明 |
 |---|---|
-| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
+| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（`autoCaptureDetail` 默认 `brief` 精简版约 300 字；显式配 `full` 才注入完整九类细则约 3000 字）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
 | 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
-| LLM 语义重排 | 候选 ≥2 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
+| LLM 语义重排 | 候选 ≥1 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
 | 教训通道 | 悔恨信号（「又错/还是失败」）或场景信号（路径/盘符/终端/命令）时**不受每会话一次限制**强制召回 rule.*/lesson.*，独立 120s 冷却——错误发生时把上次的坑摆到眼前。同一条在本会话历史里出现过就不再注入（v0.1.20 修 marker 格式，此前去重形同虚设） |
 | 轮末自动提取 | 每轮结束（`agent/turn-stopping`）异步回顾对话、LLM 提取高置信记忆自动沉淀（对标 Claude Code extractMemories：AI 用 AI 写记忆，不依赖主模型当轮意愿）。互斥：主 agent 30s 内手动写过则跳过；提取中不重入；同会话 120s 冷却；fire-and-forget 不阻塞回合收尾。写入走与 memory_set 同源的最小闸门（前缀白名单 + 明文凭据拦截），auth.* 一律不提取，`source=轮末提取` |
 | 记忆索引兜底 | 首轮 0 召回时注入动态【记忆索引】，**只列 key 不列摘要**（global 4 个：user.* 画像固定 2 席 + 其余最新 2 席；工作区 scope 各 3 个；v0.1.20 实测 424 → 约 160 字），不落盘；索引注入后本会话不再补召回，避免两套重叠（v0.1.20） |
 | 新鲜度标注 | 每条召回显示天龄（今天/昨天/N 天前）；>1 天附漂移警告——时点观察，点名文件/路径引用前先验证现状 |
 | 来源引证 | `memory_set` 自动填「日期+会话 id」，召回行展示 `· 自2026-09-01 s=xxx` |
-| 子代理隔离 | 子代理会话注入只读守则 + `memory_set` 硬层拒绝写 global（提示 `scope=sub:<id>`）；成果回传父会话沉淀 |
-| 记忆代谢 | `memory_dream` 工具 + `/memory dream`：task 超 30 天 / 任意超 90 天 / 标记完成超 14 天出候选，由模型决定更新/归档/删除 |
-| 注入预算 | 条数上限（`autoRecallLimit`，默认 2）之外再加字符预算（`autoRecallBudgetChars`，v0.1.20 起默认 300，原 600）：超出按分数顺序截断——单条成本约 200 字，300 的预算实际多为 1 条、偶尔 2 条；漂移警告合并为一段而非每条一段（v0.1.16） |
+| 子代理隔离 | 子代理会话注入只读守则 + `memory_set` 硬层拒绝写 global（提示 `scope=sub:<id>`）；`memory_get` 读 `auth.*` 被硬层拒绝；`memory_search` 不带 scope 时只返回 `sub:<id>` 与当前工作区 scope（不含 global，结果亦排除 auth.*）；成果回传父会话沉淀 |
+| 记忆代谢 | `memory_dream` 工具 + `/memory dream`：task 超 30 天 / 任意超 90 天 / 标记完成超 14 天出候选，由模型决定更新/归档/删除；`memory_dream({ apply: true })` 直接归档——>90 天条目 value 压缩为摘要、原文移入 `full` |
+| 注入预算 | 条数上限（`autoRecallLimit`，默认 2）+ 会话级总预算 `injectionBudgetChars`（默认 1200）：单轮「守则 + 教训 + 召回 + 索引」共享，按优先级串行分配——守则是静态文案不受砍，剩余预算不足时依次挤掉教训/召回/索引；单通道预算 `autoRecallBudgetChars`（v0.1.20 起默认 300，原 600）与剩余总预算取小，超出按分数顺序截断（单条成本约 200 字，300 的预算实际多为 1 条、偶尔 2 条）；漂移警告合并为一段而非每条一段（v0.1.16） |
 | 召回阈值 | 绝对下限 + 相对比例组合（v0.1.17）：`autoRecallMinScore`（默认 3）挡住"整体都不相关"；`autoRecallRelativeFloor`（默认 0.5）只留与最高分同量级的，挡住"矮子里拔将军" |
 | 补位收口 | `rrfFirstTurnOnly`（默认 true，v0.1.18）：RRF 语义补位只在首轮兜底；非首轮词法被阈值过滤即整体不相关，注入 0 条而非用另一通道放回排名靠前的记忆 |
 | 注入去重 | 会话注入状态落盘 `session-injections.json`（v0.1.19，30 天 TTL）+ form 级去重（不再比对正文）：内存 Map 重启即失效会让同一会话每重启一次重复注入一份守则/召回（实测 5 次 = 8722 字） |
 | 记忆导入 | `memory_import` + `/memory import`：CLAUDE.md / MEMORY.md / Claude Code memories.json，自动分 ref/rule/lesson 前缀，与库中 ≥70% 相似自动跳过 |
 | 凭据隔离 | `auth.*` 不参与任何自动注入通道（召回/教训/索引，v0.1.20）：实测 `[global/auth.platforms]` 会把明文密码带进每个新会话的上下文；凭据只在模型显式 `memory_search` / `memory_get` 时返回 |
-| 会话回捞 | `memory_recall`：走 `ctx.get('sessionQuery')` 全文检索历史会话，记忆没记但以前说过的事能捞回来 |
+| 会话回捞 | `memory_recall`：走 `ctx.get('sessionQuery')` 全文检索历史会话，记忆没记但以前说过的事能捞回来；强制按当前会话工作区（cwd）过滤，会话无 cwd 时报错（跨会话检索不可用） |
 | 内容冲突检测 | 写入时对同 scope 条目算内容相似度，≥55% 警告「确认是否应更新该条而非新建」 |
-| 治理面板 | 设置页「记忆」分区 5 个开关（自动回忆/自动捕获/回忆重排/RRF 召回/写入审批）即时生效；`/memory panel` 生成自包含 HTML 浏览/搜索（auth.* 凭据排除） |
+| 治理面板 | 设置页「记忆」分区 6 个开关（自动回忆/自动捕获/回忆重排/RRF 召回/RRF 首轮限定/写入审批）即时生效；`/memory panel` 在 `dataDir`（默认 `$DSH_HOME/dsh-persistent-memory`）生成自包含 HTML 浏览/搜索（auth.* 凭据排除） |
 | 防护 | 注入前清洗控制字符/危险 URI/提示注入指令；同 scope 高相似 key 自动合并；stat 缓存失效 |
 
 ## 模型工具
 
-- `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）
+- `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）；库达 `maxItems`（默认 2000）后拒绝**新增**（更新已有 key 不受限），错误提示跑 `memory_dream`；`/memory restore` 作为救援通道不受此限
 - `memory_get` — 按 key 读取（`includeFull` 才返回完整正文）
 - `memory_search` — 关键词/标签/作用域搜索
 - `memory_forget` — 删除一条
 - `memory_stats` — 记忆库概况
-- `memory_dream` — 代谢候选清单
-- `memory_import` — 外部文件导入
+- `memory_dream` — 代谢候选清单；`apply: true` 时直接归档：>90 天条目 value 压缩为摘要、原文移入 `full`
+- `memory_import` — 外部文件导入：目标 scope 默认**当前工作区 scope**（`DSH_WORKSPACE_NAME` 优先，非 global）；三条限制——只允许导入工作区内的文件（realpath 白名单，防 symlink 逃逸）、单文件 ≤2MB、命中凭据闸门（token/secret/sk-/ghp_/AKIA/BEGIN PRIVATE KEY 等）的条目整条丢弃
 - `memory_recall` — 历史会话回捞
-- `/memory` 命令 — `status` / `recall` / `remember` / `forget` / `dream` / `import` / `panel`，人不经过模型也能操作
+- `/memory` 命令 — `status` / `recall` / `remember` / `forget` / `dream` / `import` / `export <文件>` / `restore <文件>` / `panel`，人不经过模型也能操作（`export` 导出完整 JSON（含 `full`）用于备份，库里有 auth.* 时会提示导出文件含明文凭据；`restore` 先校验来源文件、再自动把当前库备份为 `memory.jsonl.pre-restore-<时间戳>`，然后按 scope+key 覆盖或补入——是合并而非清库，空 items 不清库，非法文件报错且不写库）
 
 ## 安装
 
@@ -117,15 +117,18 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
         autoCapture: true           # 每会话注入记忆守则
         autoExtract: true           # 轮末自动提取（默认开，可在 cordis.yml 关闭）
         autoExtractCooldownMs: 120000  # 同一会话提取冷却（默认 120s）
-        autoCaptureDetail: full     # 守则详略：full（默认，完整守则约 2760 字）| brief（精简版约 210 字）
+        autoCaptureDetail: brief    # 守则详略：brief（默认，精简版约 300 字）| full（完整九类细则约 3000 字，需显式配置）
+        injectionBudgetChars: 1200  # 单轮「守则+教训+召回+索引」会话级字符总预算（默认 1200，下限 300；守则是静态文案不受砍）
         autoRecallBudgetChars: 300  # 单次召回注入字符预算（默认 300 ≈ 1 条），超出按分数截断
         autoRecallMinScore: 3       # 非首轮召回的绝对分数下限（原 1 过松，会注入无关记忆）
         autoRecallRelativeFloor: 0.5 # 相对阈值：低于最高分该比例的记忆不注入；0 禁用
         taskTtlDays: 30             # task.* 保鲜期，超期在召回评分中降权
+        fullMaxChars: 8000          # full 完整正文总长上限（默认 8000）：最新原文带时间戳置顶，不再尾部无限追加
+        maxItems: 2000              # 写入容量守卫：达上限拒绝新增（更新不受限），提示跑 memory_dream
         approveOnSet: false         # 写入审批门（开启后须用户确认）
         dedupeOnSet: true           # 同 scope 高相似 key 自动合并
         synonymExpansion: true      # 同义词扩展评分
-        autoRecallOnce: true        # 每会话只召回一次 + 冷却
+        autoRecallOnce: true        # 每会话只召回一次（false 时改用 cooldown）
         autoRecallCooldownMs: 600000
 ```
 
@@ -135,23 +138,24 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
 
 - **自动沉淀**：无需操作——守则每会话首轮注入，模型自己判断该记什么；账号密码类只有你明确说「记住」才写；
 - **主动检索**：`/memory recall <关键词>` 或 `memory_search`；
-- **定期代谢**：`/memory dream` 看过期候选，让 agent 用 `memory_set`/`memory_forget` 处理；
+- **定期代谢**：`/memory dream` 看过期候选，让 agent 用 `memory_set`/`memory_forget` 处理，或跑 `memory_dream({ apply: true })` 把 >90 天条目一键归档（value 压成摘要、原文进 `full`）；
 - **导入旧记忆**：`/memory import <CLAUDE.md 或 memories.json 绝对路径>`；
-- **设置面板**：设置页「记忆」分区 5 个开关即时生效；`/memory panel` 生成 HTML 面板文件，浏览器打开可浏览/搜索全部记忆。
+- **备份 / 迁移**：`/memory export <文件>` 导出完整 JSON（含 `full`；含 auth.* 时会提示明文风险），`/memory restore <文件>` 恢复；恢复先校验文件、再自动备份当前库为 `memory.jsonl.pre-restore-<时间戳>`（可回滚），随后按 scope+key 覆盖/补入（合并，不清库）；
+- **设置面板**：设置页「记忆」分区 6 个开关即时生效；`/memory panel` 在 `dataDir`（默认 `$DSH_HOME/dsh-persistent-memory`，不再是进程 cwd）生成 HTML 面板文件，浏览器打开可浏览/搜索全部记忆。
 
 ## 架构
 
 ```
 lib/index.js    Host 半部分（ESM；inject tools/commands/settings，webServer 惰性）
-  ├─ Config（schemastery）      17 个可调参数、加载期校验
-  ├─ 写侧闸门                   前缀白名单 / ≤160 字 / tags ≤3 / 凭据检测 / 冲突警告
-  ├─ pre-step 管线              守则 → 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底
+  ├─ Config（schemastery）      28 个可调参数、加载期校验
+  ├─ 写侧闸门                   前缀白名单 / ≤240 字 / tags ≤3 / 凭据检测 / 冲突警告
+  ├─ pre-step 管线              守则 → 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底（四通道共享会话级注入预算 injectionBudgetChars，按此优先级串行分配）
   ├─ RRF 混合召回               bigram-Jaccard 中文二元组 + 词法双排名倒数融合（K=60）
   ├─ 工具注册                   defineTool × 8 + /memory 命令
   ├─ /_dsh/dsh-persistent-memory/settings  面板 RPC（GET 快照 / POST 保存，localhost-only）
-  └─ settings.register           ns=dsh-persistent-memory（5 字段，applies=live）
+  └─ settings.register           ns=dsh-persistent-memory（6 字段，applies=live）
 lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议）
-  └─ settings.section slot       设置页「记忆」分区，5 个开关 React 组件
+  └─ settings.section slot       设置页「记忆」分区，6 个开关 React 组件
 ```
 
 ### 关键机制与阈值
@@ -159,23 +163,34 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 | 机制 | 数值 |
 |---|---|
 | 召回评分 | 首轮阈值 6（一次 key 直中+少量辅助）；弱主题词降权；value 命中降分 |
+| 首轮召回门槛 | 首轮阈值 6 只能靠 key 直中跨过（key 全等 9 分 / 部分命中 5 分）再加少量辅助分（当前工作区 scope +4、tags 命中 +2、同义词落到 key +2、user.* 首轮 +1）；仅 value 命中只有 2 分（弱主题词 1 分）——「只记得内容里的词」在首轮召不到，改用 `memory_search` 或等后续轮次 |
 | RRF 融合 | K=60；候选 rrf ≥0.025 才进入语义补位/重排池 |
-| LLM 重排 | 候选 ≥2 才调用一次，5s 超时+失败降级词法，宁少勿多 |
+| LLM 重排 | 候选 ≥1 就调用一次，5s 超时+失败降级词法，宁少勿多 |
 | 教训通道 | 悔恨/场景信号强制召回 rule.*/lesson.*，独立 120s 冷却，不受 once 限制 |
 | 索引配额 | global 4 条（user.* 固定 2 席），工作区 scope 各 3 条 |
-| 写侧闸门 | value ≤160 字、tags ≤3、前缀白名单九类 |
+| 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「守则+教训+召回+索引」共享；守则（静态文案）不受砍，剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
+| 写侧闸门 | value ≤240 字、tags ≤3、前缀白名单九类 |
+| 写入容量 | `maxItems` 默认 2000：达上限拒绝新增（更新不受限），提示跑 `memory_dream`；`/memory restore` 救援通道不受限 |
+| full 归档 | `fullMaxChars` 默认 8000：同 key 反复超长更新时最新原文带时间戳置顶，旧内容保留在尾部但整体受上限约束，超限截断并警告 |
 | 冲突检测 | 同 scope 内容相似 ≥55% 警告 |
 | 导入去重 | 与库中 ≥70% 相似自动跳过 |
-| 代谢候选 | task>30 天 / 任意>90 天 / 完成>14 天 |
+| 代谢候选 | task>30 天 / 任意>90 天 / 完成>14 天；`memory_dream({ apply: true })` 归档 >90 天条目（value 压成摘要、原文进 full） |
 | 生命周期 | 所有注册随插件 Fiber 卸载；子代理写 global 被硬层拒绝 |
 
 ## 已知限制
 
 - RRF 混合召回是词法+中文二元组双排名，**无 embedding**——远距离语义联想仍依赖词面部分重叠或 LLM 重排兜底；
-- `memory_recall` 依赖 `sessionQuery` 服务，宿主未提供时报错降级；
+- `memory_recall` 依赖 `sessionQuery` 服务，宿主未提供时报错（工具不可用）；且强制按会话工作区（cwd）过滤，会话无 cwd 时报错（跨会话检索不可用）；
 - 审批门默认关闭；开启后每次写入需用户确认（`confirmed: true`）；
 - 代谢只列候选，更新/归档/删除由模型执行，不自动删；
 - 会话回捞返回的是历史会话片段，不保证与当前记忆库语义对齐。
+
+## 隐私与数据边界
+
+- **记忆内容会进入模型上下文**：`memory_get` / `memory_search` 返回的 `value` 与 `full` 作为工具结果进入会话上下文，并随该会话的请求发送至配置的 LLM provider（当前默认 provider 为 `deepseek-official`）；记忆库本身只落盘在本地 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`，插件不向其它服务发送记忆数据。
+- **自动注入通道已排除凭据**：`auth.*` 前缀条目，以及 `value` 命中凭据正则（token / secret / api key / bearer / sk- / ghp_ / AKIA / PRIVATE KEY / 中文口令）的条目，都不参与自动注入（召回 / 教训 / 索引；凭据类记忆只在模型显式 `memory_search` / `memory_get` 时返回）。模型显式调用时主会话仍可读到 `auth.*`；子代理会被硬层拒绝。
+- **导出文件是明文**：`/memory export` 会把整库（含 `auth.*` 明文凭据与所有 `full` 正文）写入你指定的文件，仅本地落盘、插件不上传，但请自行保管该文件。
+- **`<memory-data trust="untrusted">` 是数据标注，不是脱敏**：工具输出中的记忆内容包裹在该标签内，并经 `sanitizeValue` 清洗（控制字符、危险 URI scheme、提示注入模式），但清洗不改变内容本身——不要把明文凭据写进非 `auth.*` 前缀，敏感内容入库前请自行判断。
 
 ## 开发
 
