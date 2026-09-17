@@ -33,6 +33,22 @@ export function findCredentialMatch(body: string): string | null {
   return m ? m[0] : null
 }
 
+/**
+ * C7：凭据掩码（工具出库面用）。记忆原文会随工具返回进入会话上下文并外发至
+ * 配置的 LLM provider——auth.* 与命中凭据正则的条目默认只回掩码，保留可识别
+ * 前缀（sk-/ghp_/AKIA/Bearer）以便用户知道"这里有一条什么凭据记忆"。
+ */
+export function maskCredential(text: string): string {
+  const m = text.match(/(sk-|ghp_|AKIA|Bearer\s+)/i)
+  if (m) return `${m[1]}****（凭据已掩码，memory_get 带 confirmed:true 可取回原文）`
+  return '****（凭据类记忆已掩码，memory_get 带 confirmed:true 可取回原文）'
+}
+
+/** C7：该条目是否属于"默认掩码、需显式确认才返回原文"的类别 */
+export function isCredentialItem(key: string, value: string): boolean {
+  return key.toLowerCase().startsWith('auth.') || findCredentialMatch(value) !== null
+}
+
 export interface UpsertInput {
   key: string
   value: string

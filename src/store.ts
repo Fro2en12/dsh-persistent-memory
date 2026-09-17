@@ -103,7 +103,10 @@ export function createStore(opts: StoreOptions): MemoryStore {
         }
         return releaseWriteLock
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+        const code = (err as NodeJS.ErrnoException).code
+        // EEXIST = 锁已被持有；Windows 上并发创建/删除同名文件还会报 EPERM/EACCES/EBUSY
+        // （共享冲突而非"已存在"），同样按「锁被占用」处理并重试
+        if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw err
       }
       // 陈旧锁（持有者崩溃）：超过 LOCK_STALE_MS 未更新则清除
       try {
