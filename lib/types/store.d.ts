@@ -20,6 +20,11 @@ export interface StoreFs {
     copyFile(from: string, to: string): Promise<void>;
     /** 清理 tmp 残留与释放写锁（必填：缺失会导致锁泄漏） */
     unlink(path: string): Promise<void>;
+    /**
+     * 可选：更新文件 mtime（写锁心跳/长写刷新用）。
+     * 未提供时 store 降级为「校验 token 后重写同样内容」来刷新 mtime，功能不缺失。
+     */
+    utimes?(path: string, mtimeMs: number): Promise<void>;
 }
 /** n3：JSONL 首行 schema 哨兵——未来字段迁移的抓手（读取时跳过，不计入条目/坏行） */
 export declare const SCHEMA_SENTINEL = "{\"__schema\":1}";

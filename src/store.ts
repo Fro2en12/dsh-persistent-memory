@@ -21,6 +21,11 @@ export interface StoreFs {
   copyFile(from: string, to: string): Promise<void>
   /** 清理 tmp 残留与释放写锁（必填：缺失会导致锁泄漏） */
   unlink(path: string): Promise<void>
+  /**
+   * 可选：更新文件 mtime（写锁心跳/长写刷新用）。
+   * 未提供时 store 降级为「校验 token 后重写同样内容」来刷新 mtime，功能不缺失。
+   */
+  utimes?(path: string, mtimeMs: number): Promise<void>
 }
 
 /** n3：JSONL 首行 schema 哨兵——未来字段迁移的抓手（读取时跳过，不计入条目/坏行） */
@@ -86,51 +91,204 @@ export function createStore(opts: StoreOptions): MemoryStore {
   // B3：跨进程写锁（fs.open 'wx' 独占创建 + 陈旧锁超时清除）。
   // 单靠 size/mtime 乐观校验有 TOCTOU 窗口（校验与 rename 之间会让出事件循环），
   // 两者叠加：锁负责互斥，版本校验负责挡住绕过锁的外部写入（手工编辑/其它工具）。
+  //
+  // S6/S9 等价性加固：锁内容 = { pid, token, ts }，把「删除锁」收敛为可证明的所有权操作。
+  //  ① 释放：先读锁文件比对 token，只有持有者才 unlink
+  //     （修复：A 的锁被判陈旧抢走后，A 的 release 会删掉抢锁者的新锁）；
+  //  ② 陈旧清除：在 lockFile.reap 临界区内做「二次校验（mtime 仍超阈值 + token 未变）」后才 unlink
+  //     （修复：旧实现 stat→无条件 unlink 无 CAS，B 会删掉 C 抢先建立的新锁）；
+  //  ③ 心跳 + rename 前刷新 mtime：长写（大库序列化/慢盘/挂起唤醒）不再被判陈旧而抢锁。
   const LOCK_STALE_MS = 10_000
   const LOCK_WAIT_MS = 10_000
+  /** 心跳周期：必须远小于陈旧阈值，保证活着的持锁者永远不会看起来陈旧 */
+  const LOCK_HEARTBEAT_MS = Math.max(250, Math.floor(LOCK_STALE_MS / 4))
+  /** 清除陈旧锁的临界区（reap）文件泄漏多久后可被清理；临界区本身只有几个 syscall */
+  const LOCK_REAPER_STALE_MS = 5_000
   const lockFile = opts.dataFile + '.lock'
+  const reapFile = lockFile + '.reap'
   const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-  async function acquireWriteLock(): Promise<() => Promise<void>> {
+  function makeToken(): string {
+    // 每次获取锁都用新 token：同一进程的多次写入/pid 复用也不会互相误认
+    return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10)
+  }
+  function lockBody(token: string): string {
+    return JSON.stringify({ pid: process.pid, token, ts: Date.now() })
+  }
+  /** 解析锁持有者 token；非本格式（旧版裸 pid、被截断、非 JSON）一律返回 null = 「不是我的锁」 */
+  function parseToken(raw: string): string | null {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed && typeof parsed === 'object' && typeof (parsed as { token?: unknown }).token === 'string') {
+        return (parsed as { token: string }).token
+      }
+    } catch { /* 非 JSON */ }
+    return null
+  }
+  async function readFileOrNull(path: string): Promise<string | null> {
+    try {
+      return await opts.fs.readFile(path, 'utf8')
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 删除「确实是自己的」锁文件（S6 修复点）。
+   * 修复前是无条件 unlink：A 的锁被判陈旧、被 B 清除并抢走后，A 的 release 仍会删掉 B 刚
+   * 建立的新锁 → C 又能 open('wx') 拿到锁 → 两个写者并存 → 丢更新。
+   * 现在 token 不匹配就什么都不做：别人的锁只能由它自己（或陈旧清除逻辑）处置。
+   */
+  async function releaseFile(file: string, token: string): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      try {
+        await opts.fs.stat(file)
+      } catch {
+        return                                     // 文件已不在（已释放/被别人清掉）
+      }
+      const raw = await readFileOrNull(file)
+      if (raw === null) return                     // 读不到内容：保守不动
+      if (parseToken(raw) !== token) return        // 锁已易主：绝不删别人的锁
+      try {
+        await opts.fs.unlink(file)
+        return
+      } catch {
+        await sleep(10)
+      }
+    }
+  }
+
+  /**
+   * c) 刷新锁文件 mtime（心跳）。
+   * 返回 'held' = 确认仍持有；'foreign' = 锁已被别人接管；'absent' = 锁文件不在（或读不到）。
+   * 刷新前比对 token：锁易主后绝不「复活」或改写别人的锁（否则等于伪造持有权）。
+   * StoreFs.utimes 缺失时降级为重写同样内容（内容/token 不变，仅 mtime 前进）。
+   */
+  async function refreshLock(token: string): Promise<'held' | 'foreign' | 'absent'> {
+    try {
+      await opts.fs.stat(lockFile)
+    } catch {
+      return 'absent'
+    }
+    const raw = await readFileOrNull(lockFile)
+    if (raw === null) return 'absent'
+    if (parseToken(raw) !== token) return 'foreign'
+    if (opts.fs.utimes) {
+      await opts.fs.utimes(lockFile, Date.now())
+    } else {
+      const fh = await opts.fs.open(lockFile, 'w')
+      try {
+        await fh.writeFile(lockBody(token), 'utf8')
+      } finally {
+        await fh.close()
+      }
+    }
+    return 'held'
+  }
+
+  /**
+   * b) 陈旧锁清除（CAS 近似）。返回 true = 锁文件已消失，应立即重试 open('wx')。
+   *
+   * 旧的「stat → 无条件 unlink」没有 CAS：B 判陈旧后、unlink 生效前，C 可能已清掉旧锁并
+   * 原子新建了自己的锁，B 的 unlink 就把 C 的新锁删了（S9）。这里把清除收敛成临界区：
+   *  · 只有拿到 reap 文件（open 'wx' 独占）的进程才允许动 lockFile —— 同一时刻只有一个清除者；
+   *  · unlink 前二次校验：mtime 仍超阈值 且 token 与判陈旧时读到的一致；任一项变化即放弃本轮；
+   *  · lockFile 存在期间没有进程能 open('wx') 成功，因此临界区内的 unlink 不可能删到新锁。
+   */
+  async function clearStaleLock(): Promise<boolean> {
+    let observed: StoreFsStat
+    try {
+      observed = await opts.fs.stat(lockFile)
+    } catch {
+      return true                                  // 锁已消失 → 立即重试
+    }
+    if (Date.now() - observed.mtimeMs <= LOCK_STALE_MS) return false        // 锁新鲜：等
+    const observedToken = parseToken((await readFileOrNull(lockFile)) ?? '')
+    const reapToken = makeToken()
+    try {
+      const fh = await opts.fs.open(reapFile, 'wx')
+      try {
+        await fh.writeFile(lockBody(reapToken), 'utf8')
+      } finally {
+        await fh.close()
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw err
+      await clearStaleReaper()                     // 别人正在清除（或 reap 文件泄漏）
+      return false
+    }
+    try {
+      let again: StoreFsStat
+      try {
+        again = await opts.fs.stat(lockFile)
+      } catch {
+        return true                                // 别人已经清掉了
+      }
+      if (Date.now() - again.mtimeMs <= LOCK_STALE_MS) return false         // 已刷新/已被新建
+      if (parseToken((await readFileOrNull(lockFile)) ?? '') !== observedToken) return false
+      try {
+        await opts.fs.unlink(lockFile)
+      } catch { /* 竞态下别人已清 */ }
+      return true
+    } finally {
+      await releaseFile(reapFile, reapToken)
+    }
+  }
+
+  /** reap 文件泄漏（清除者崩溃）：超过阈值后清理，否则陈旧锁将永远无人可清 */
+  async function clearStaleReaper(): Promise<void> {
+    try {
+      const st = await opts.fs.stat(reapFile)
+      if (Date.now() - st.mtimeMs <= LOCK_REAPER_STALE_MS) return
+      const before = await readFileOrNull(reapFile)
+      const now = await opts.fs.stat(reapFile)
+      if (Date.now() - now.mtimeMs <= LOCK_REAPER_STALE_MS) return           // 刚被别人重建
+      const cur = await readFileOrNull(reapFile)
+      if (cur === null || cur !== before) return
+      await opts.fs.unlink(reapFile)
+    } catch { /* 已消失或不可读：忽略 */ }
+  }
+
+  interface WriteLock {
+    release(): Promise<void>
+    /** 刷新 mtime 并报告所有权；永不 reject（心跳定时器直接调用） */
+    refresh(): Promise<'held' | 'foreign' | 'absent'>
+  }
+
+  async function acquireWriteLock(): Promise<WriteLock> {
     const deadline = Date.now() + LOCK_WAIT_MS
+    const token = makeToken()
     for (;;) {
       try {
-        const fh = await opts.fs.open(lockFile, 'wx')
+        const fh = await opts.fs.open(lockFile, 'wx')   // 唯一的所有权来源：原子独占创建
         try {
-          await fh.writeFile(String(process.pid), 'utf8')
+          await fh.writeFile(lockBody(token), 'utf8')
         } finally {
           await fh.close()
         }
-        return releaseWriteLock
+        return {
+          release: () => releaseFile(lockFile, token),
+          refresh: async () => {
+            try {
+              return await refreshLock(token)
+            } catch {
+              return 'absent' as const               // 刷新失败不能打断写入主流程
+            }
+          },
+        }
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code
         // EEXIST = 锁已被持有；Windows 上并发创建/删除同名文件还会报 EPERM/EACCES/EBUSY
         // （共享冲突而非"已存在"），同样按「锁被占用」处理并重试
         if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw err
       }
-      // 陈旧锁（持有者崩溃）：超过 LOCK_STALE_MS 未更新则清除
-      try {
-        const st = await opts.fs.stat(lockFile)
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          try { await opts.fs.unlink(lockFile) } catch { /* 竞态下别人已清 */ }
-          continue
-        }
-      } catch { /* 锁已消失，立即重试 */ continue }
+      // 陈旧锁（持有者崩溃）：只在不违反「只有一个清除者 + 清除前二次校验」的前提下清除
+      if (await clearStaleLock()) continue
       if (Date.now() > deadline) {
         throw new StoreConflictError('无法获取 memory.jsonl 写锁（等待超时），本次写入放弃以避免覆盖')
       }
       await sleep(5 + Math.floor(Math.random() * 15))
-    }
-  }
-
-  async function releaseWriteLock(): Promise<void> {
-    for (let i = 0; i < 3; i++) {
-      try {
-        await opts.fs.unlink(lockFile)
-        return
-      } catch {
-        await sleep(10)
-      }
     }
   }
 
@@ -224,15 +382,19 @@ export function createStore(opts: StoreOptions): MemoryStore {
   }
 
   async function writeItems(items: MemoryItem[]): Promise<void> {
-    const release = await acquireWriteLock()
+    const lock = await acquireWriteLock()
+    // c) 心跳：慢盘/大库/进程被挂起后的恢复期间持续刷新锁 mtime，避免被判陈旧而抢锁
+    const beat = setInterval(() => { void lock.refresh() }, LOCK_HEARTBEAT_MS)
+    if (typeof (beat as { unref?: () => void }).unref === 'function') (beat as { unref: () => void }).unref()
     try {
-      await writeItemsLocked(items)
+      await writeItemsLocked(items, lock.refresh)
     } finally {
-      await release()
+      clearInterval(beat)
+      await lock.release()
     }
   }
 
-  async function writeItemsLocked(items: MemoryItem[]): Promise<void> {
+  async function writeItemsLocked(items: MemoryItem[], lockRefresh: () => Promise<'held' | 'foreign' | 'absent'>): Promise<void> {
     try {
       // B3 乐观并发：磁盘仍是本实例读到的那一版才允许覆盖，否则交给 withConflictRetry 重试
       if (readState) {
@@ -268,6 +430,12 @@ export function createStore(opts: StoreOptions): MemoryStore {
           await fh.sync()
         } finally {
           await fh.close()
+        }
+        // c) 耗时阶段（copyFile/.bak + 整库序列化 + tmp 落盘 fsync）之后、rename 之前刷新锁 mtime，
+        //    让长写不会被判陈旧而抢锁；同时复核锁仍在自己手里——互斥一旦被破坏，
+        //    宁可报并发冲突交给 withConflictRetry 重试，也不静默覆盖别人的写入。
+        if ((await lockRefresh()) === 'foreign') {
+          throw new StoreConflictError('memory.jsonl 写锁已被其他进程接管（并发冲突），本次写入放弃以避免覆盖')
         }
         try {
           await opts.fs.rename(tmp, opts.dataFile)
