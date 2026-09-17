@@ -27,8 +27,10 @@ export interface Config {
     autoRecallFallback?: boolean;
     /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
     autoCapture?: boolean;
-    /** 守则详略：brief（默认，精简版约 400 字）| full（完整九类细则） */
+    /** 守则详略：brief（默认，约 210 字）| full（完整九类细则，约 3000 字） */
     autoCaptureDetail?: 'brief' | 'full';
+    /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
+    injectionBudgetChars?: number;
     /** 每个会话只自动注入一次记忆；冷却期内不重复注入（默认 true） */
     autoRecallOnce?: boolean;
     /** 自动注入冷却毫秒数；同一会话在该窗口内不重复注入（默认 10 分钟） */
@@ -85,6 +87,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;
+    injectionBudgetChars: z<number, number>;
     importAllowRoots: z<string[], string[]>;
 }>, Schemastery.ObjectT<{
     dataDir: z<string, string>;
@@ -113,6 +116,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;
+    injectionBudgetChars: z<number, number>;
     importAllowRoots: z<string[], string[]>;
 }>>;
 export declare function apply(ctx: Context, config: Config): void;

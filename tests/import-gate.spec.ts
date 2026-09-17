@@ -117,7 +117,7 @@ describe('M6 导入限制', () => {
     const tool = fake.toolDefs.get('memory_import')
     await tool.execute({ path: p, scope: 'global' })
     const getTool = fake.toolDefs.get('memory_get')
-    const g = await getTool.execute({ key: 'import-0.ref-long', includeFull: true })
+    const g = await getTool.execute({ key: 'ref.0.ref-long', includeFull: true })
     expect(g.found).toBe(true)
     expect(g.full.length).toBeLessThanOrEqual(243)   // 240 + 省略号（输出面 NFKC 将 … 展开为 ...）
   })

@@ -94,7 +94,7 @@ describe('M9 提取基线：import', () => {
   it('parseImportEntries 走 JSON walk，根前缀 import（当前行为，M7 才修正）', () => {
     const entries = parseImportEntries('[{"key":"x","value":"v"}]', 'C:/tmp/memories.json', { valueMaxChars: 240 })
     expect(entries).toHaveLength(1)
-    expect(entries[0].key).toBe('ref-0.x')
+    expect(entries[0].key).toBe('ref.0.x')
     expect(entries[0].value).toBe('v')
   })
 
