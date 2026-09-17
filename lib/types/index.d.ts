@@ -53,6 +53,8 @@ export interface Config {
     taskTtlDays?: number;
     /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
     autoExtract?: boolean;
+    /** memory_import 允许的根目录白名单；缺省为 [DSH_WORKSPACE]（无环境变量时拒绝导入） */
+    importAllowRoots?: string[];
     /** 自动提取冷却毫秒数（默认 120 秒）：同一会话该窗口内不重复提取 */
     autoExtractCooldownMs?: number;
 }
@@ -83,6 +85,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;
+    importAllowRoots: z<string[], string[]>;
 }>, Schemastery.ObjectT<{
     dataDir: z<string, string>;
     defaultScope: z<string, string>;
@@ -110,5 +113,6 @@ export declare const Config: z<Schemastery.ObjectS<{
     taskTtlDays: z<number, number>;
     autoExtract: z<boolean, boolean>;
     autoExtractCooldownMs: z<number, number>;
+    importAllowRoots: z<string[], string[]>;
 }>>;
 export declare function apply(ctx: Context, config: Config): void;

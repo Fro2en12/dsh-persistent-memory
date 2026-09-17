@@ -12,7 +12,7 @@
  */
 import { existsSync, promises as fs, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, sep } from 'node:path'
 import type { Context } from 'cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
@@ -32,7 +32,7 @@ import {
   type RecallEnv,
   type ScoreEnv,
 } from './recall.js'
-import { detectCredentials, hasWeakCredentialSignal, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
+import { detectCredentials, findCredentialMatch, hasWeakCredentialSignal, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
 import { parseImportEntries } from './import.js'
 import { createStore, type StoreFileHandle, type StoreFs } from './store.js'
 
@@ -92,6 +92,8 @@ export interface Config {
   taskTtlDays?: number
   /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
   autoExtract?: boolean
+  /** memory_import 允许的根目录白名单；缺省为 [DSH_WORKSPACE]（无环境变量时拒绝导入） */
+  importAllowRoots?: string[]
   /** 自动提取冷却毫秒数（默认 120 秒）：同一会话该窗口内不重复提取 */
   autoExtractCooldownMs?: number
 }
@@ -123,6 +125,7 @@ export const Config = z.object({
   taskTtlDays: z.number().default(30),
   autoExtract: z.boolean().default(true),
   autoExtractCooldownMs: z.number().default(120 * 1000),
+  importAllowRoots: z.array(z.string()).default([]),
 })
 
 
@@ -1419,12 +1422,78 @@ export function apply(ctx: Context, config: Config): void {
   // ── 记忆导入（v0.1.9）：CLAUDE.md / MEMORY.md / memories.json 一键入库 ──
 
 
+  // ── 导入守卫（C3 + M6，v0.1.23）────────────────────────────────────
+  // C3：根目录白名单 + realpath 前缀判断（防 symlink 逃逸）+ 拒绝 \\?\/UNC/设备路径。
+  // M6：2MB 大小上限；每条过增强版凭据闸门（命中整条丢弃）；full 施加 valueMaxChars 截断；
+  // 默认 scope 改当前工作区而非 global。
+  const MAX_IMPORT_BYTES = 2 * 1024 * 1024
+  const defaultImportScope = (): string => {
+    for (const envName of ['DSH_WORKSPACE_NAME', 'DSH_WORKSPACE', 'DSH_SESSION_WORKSPACE']) {
+      const v = process.env[envName]
+      if (v && v.trim()) return v.trim()
+    }
+    try {
+      const b = basename(process.cwd())
+      if (b) return b
+    } catch { /* ignore */ }
+    return defaultScope
+  }
+  async function importFileToStore(filePath: string, scope: string): Promise<{ imported: number; skipped: number; rejected: number; summary: string }> {
+    if (/^\\\\/.test(filePath)) {
+      throw new Error('memory_import: 拒绝 \\\\?\\、UNC 与设备路径')
+    }
+    const allowRoots = config.importAllowRoots?.length
+      ? config.importAllowRoots
+      : [process.env.DSH_WORKSPACE].filter(Boolean) as string[]
+    if (allowRoots.length === 0) {
+      throw new Error('memory_import: 未配置 importAllowRoots 且环境无 DSH_WORKSPACE，拒绝导入（只允许导入工作区内的文件）')
+    }
+    let resolved: string
+    try { resolved = await fs.realpath(filePath) } catch { throw new Error(`memory_import: 无法读取 ${filePath}`) }
+    let roots: string[]
+    try { roots = await Promise.all(allowRoots.map((r) => fs.realpath(r))) } catch (err) {
+      throw new Error('memory_import: 导入根目录不可用：' + String(err instanceof Error ? err.message : err))
+    }
+    if (!roots.some((r) => resolved === r || resolved.startsWith(r + sep))) {
+      throw new Error('memory_import: 只允许导入工作区内的文件')
+    }
+    const st = await fs.stat(resolved)
+    if (st.size > MAX_IMPORT_BYTES) {
+      throw new Error(`memory_import: 文件超过 ${MAX_IMPORT_BYTES} 字节上限`)
+    }
+    let raw: string
+    try { raw = await fs.readFile(resolved, 'utf8') } catch { throw new Error(`memory_import: 无法读取 ${filePath}`) }
+    const entries = parseImportEntries(raw, filePath, { valueMaxChars })
+    if (entries.length === 0) throw new Error(`memory_import: ${filePath} 没有可导入的内容`)
+    return withLock(async () => {
+      const items = await readItems()
+      const now = new Date().toISOString()
+      let imported = 0
+      let skipped = 0
+      let rejected = 0
+      for (const e of entries) {
+        // M6：凭据闸门（与 M2 同源的增强正则）——命中整条丢弃
+        if (findCredentialMatch(`${e.value}\n${e.full ?? ''}`)) { rejected++; continue }
+        // M6：full 施加 valueMaxChars 截断
+        const full = e.full !== undefined && e.full.length > valueMaxChars ? truncate(e.full, valueMaxChars) : e.full
+        const dup = items.some((item) => item.scope === scope
+          && contentSimilarity(item, { key: e.key, value: e.value, scope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem) >= 0.7)
+        if (dup) { skipped++; continue }
+        items.push({ id: makeId(), key: e.key, value: e.value, full, scope, tags: e.tags, createdAt: now, updatedAt: now, source: `import:${basename(filePath)}` })
+        imported++
+      }
+      await writeItems(items)
+      const rejectedNote = rejected > 0 ? `，${rejected} 条命中凭据闸门被拒绝` : ''
+      return { imported, skipped, rejected, summary: `导入完成：${imported} 条新增（${scope}），${skipped} 条与库中已有内容高度相似被跳过${rejectedNote}。` }
+    })
+  }
+
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_import',
     description: `把外部文件导入记忆库：CLAUDE.md / MEMORY.md / Claude Code memories.json 等。.json 按条目、.md/.txt 按段落切分，自动分配 ref/rule/lesson 前缀，value 截 ${valueMaxChars} 字余量入 full，与库中已有条目内容高度相似（≥70%）自动跳过。`,
     parameters: {
       path: { type: 'string', required: true, description: '要导入的文件绝对路径' },
-      scope: { type: 'string', description: '目标 scope，默认 global' },
+      scope: { type: 'string', description: '目标 scope，默认当前工作区 scope（DSH_WORKSPACE_NAME）' },
     },
     output: {
       schema: {
@@ -1433,6 +1502,7 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           imported: { type: 'number', required: true },
           skipped: { type: 'number', required: true },
+          rejected: { type: 'number', required: true },
           summary: { type: 'string', required: true },
         },
       },
@@ -1441,26 +1511,8 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: { path: string; scope?: string }) {
       const filePath = String(args.path || '').trim()
       if (!filePath) throw new Error('memory_import: path 必填')
-      const scope = normalizeScope(args.scope, defaultScope)
-      let raw: string
-      try { raw = await fs.readFile(filePath, 'utf8') } catch { throw new Error(`memory_import: 无法读取 ${filePath}`) }
-      const entries = parseImportEntries(raw, filePath, { valueMaxChars })
-      if (entries.length === 0) throw new Error(`memory_import: ${filePath} 没有可导入的内容`)
-      return withLock(async () => {
-        const items = await readItems()
-        const now = new Date().toISOString()
-        let imported = 0
-        let skipped = 0
-        for (const e of entries) {
-          const dup = items.some((item) => item.scope === scope
-            && contentSimilarity(item, { key: e.key, value: e.value, scope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem) >= 0.7)
-          if (dup) { skipped++; continue }
-          items.push({ id: makeId(), key: e.key, value: e.value, full: e.full, scope, tags: e.tags, createdAt: now, updatedAt: now, source: `import:${basename(filePath)}` })
-          imported++
-        }
-        await writeItems(items)
-        return { imported, skipped, summary: `导入完成：${imported} 条新增（${scope}），${skipped} 条与库中已有内容高度相似被跳过。` }
-      })
+      const scope = normalizeScope(args.scope, defaultImportScope())
+      return importFileToStore(filePath, scope)
     },
   })), '@dsh-external/dsh-persistent-memory: memory_import')
 
@@ -1614,26 +1666,12 @@ export function apply(ctx: Context, config: Config): void {
       }
       case 'import': {
         if (!arg) return { kind: 'error', text: 'Usage: /memory import <文件绝对路径>' }
-        let raw: string
-        try { raw = await fs.readFile(arg, 'utf8') } catch { return { kind: 'error', text: `无法读取文件：${arg}` } }
-        let entries
-        try { entries = parseImportEntries(raw, arg, { valueMaxChars }) } catch (err) { return { kind: 'error', text: String(err instanceof Error ? err.message : err) } }
-        if (entries.length === 0) return { kind: 'error', text: `${arg} 没有可导入的内容。` }
-        let imported = 0
-        let skipped = 0
-        const now = new Date().toISOString()
-        await withLock(async () => {
-          const items = await readItems()
-          for (const e of entries) {
-            const dup = items.some((item) => item.scope === defaultScope
-              && contentSimilarity(item, { key: e.key, value: e.value, scope: defaultScope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem) >= 0.7)
-            if (dup) { skipped++; continue }
-            items.push({ id: makeId(), key: e.key, value: e.value, full: e.full, scope: defaultScope, tags: e.tags, createdAt: now, updatedAt: now, source: `import:${basename(arg)}` })
-            imported++
-          }
-          await writeItems(items)
-        })
-        return { kind: 'success', text: `导入完成：${imported} 条新增（${defaultScope}），${skipped} 条与库中已有内容高度相似被跳过。` }
+        try {
+          const r = await importFileToStore(arg, defaultImportScope())
+          return { kind: 'success', text: r.summary }
+        } catch (err) {
+          return { kind: 'error', text: String(err instanceof Error ? err.message : err) }
+        }
       }
       case 'panel': {
         const items = await withLock(async () => readItems())
