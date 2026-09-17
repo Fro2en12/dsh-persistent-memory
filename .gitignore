@@ -1,5 +1,4 @@
 node_modules/
-lib/
 *.tsbuildinfo
 *.tgz
 # 衍生与本地文件：市场目录快照、Claude Code 泄露源码副本、生成的记忆面板
