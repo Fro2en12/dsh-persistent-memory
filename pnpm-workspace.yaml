@@ -1,0 +1,4 @@
+# 单包仓库（非 workspace）；此处仅用于 pnpm 11 的配置项：
+# 依赖由 scripts/build.sh 以 junction 链接自 DSH checkout，registry 无其传递依赖，
+# 关闭「运行前依赖自检」以免 pnpm test 在 install 阶段 404。
+verifyDepsBeforeRun: false
