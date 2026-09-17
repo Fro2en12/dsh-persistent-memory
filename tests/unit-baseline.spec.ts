@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeScope, validateKeyPrefix, detectCredentials, hasWeakCredentialSignal, upsertMemory } from '../src/write-gate'
+import { normalizeScope, validateKeyPrefix, findCredentialMatch, upsertMemory } from '../src/write-gate'
 import { sanitizeValue } from '../src/sanitize'
 import { slugKey, parseImportEntries } from '../src/import'
 import { scoreItem, queryTokens, truncate, ageLabel, fitBudget, bigramJaccard, pickRecallItems } from '../src/recall'
@@ -38,11 +38,10 @@ describe('M9 提取基线：write-gate', () => {
     expect(() => validateKeyPrefix('bd-cluster.x', 'bd-cluster')).not.toThrow()
   })
 
-  it('detectCredentials 命中明文密码词；token 弱信号仅标记', () => {
-    expect(detectCredentials('password=123')).toMatch(/明文密码/)
-    expect(detectCredentials('token=abc')).toBeNull()
-    expect(hasWeakCredentialSignal('token=abc')).toBe(true)
-    expect(hasWeakCredentialSignal('普通内容')).toBe(false)
+  it('findCredentialMatch 命中凭据形态（M2 起统一为拒绝口径）', () => {
+    expect(findCredentialMatch('password=123')).not.toBeNull()
+    expect(findCredentialMatch('token=abc')).not.toBeNull()
+    expect(findCredentialMatch('普通内容')).toBeNull()
   })
 
   it('upsertMemory 同 key 覆盖更新，新 key 新建', () => {

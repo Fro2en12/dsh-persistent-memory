@@ -21,8 +21,8 @@ export interface FakeCtx {
   settingsService: FakeSettingsService
 }
 
-/** 构造 apply() 所需的最小 fake ctx（不加载 cordis/dsh 运行时） */
-export function makeFakeCtx(initState: Record<string, unknown> = {}): FakeCtx {
+/** 构造 apply() 所需的最小 fake ctx（不加载 cordis/dsh 运行时）；services 可注入 llm/sessionQuery 等 */
+export function makeFakeCtx(initState: Record<string, unknown> = {}, services: Record<string, unknown> = {}): FakeCtx {
   const state: Record<string, unknown> = { ...initState }
   let revision = 0
   const watchers: Array<(next: Record<string, unknown>) => void> = []
@@ -74,7 +74,7 @@ export function makeFakeCtx(initState: Record<string, unknown> = {}): FakeCtx {
       handlers.get(event)!.push(handler)
       return () => {}
     },
-    get: (_svc: string) => undefined,
+    get: (svc: string) => services[svc],
     logger: { debug: () => {}, warn: () => {}, info: () => {} },
     settings: settingsService,
   }

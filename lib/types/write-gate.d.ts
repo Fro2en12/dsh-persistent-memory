@@ -4,11 +4,6 @@ export declare function normalizeScope(scope: string | undefined, defaultScope: 
 /** key 前缀白名单硬校验：与守则文本同源（KEY_PREFIX_LIST） */
 export declare function validateKeyPrefix(key: string, scope: string): void;
 /**
- * 凭据检测（与守则同源）：返回需要拒绝的明文凭据原因；
- * 无命中返回 null。token/secret 类弱信号由调用方自行决定警告。
- */
-export declare function detectCredentials(body: string): string | null;
-/**
  * M2 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
  * 覆盖：弱关键词（token/secret/api key/password）、可识别形态
  * （bearer 长串、sk-/ghp_/AKIA、BEGIN PRIVATE KEY 块）与中文口令词。
@@ -16,8 +11,6 @@ export declare function detectCredentials(body: string): string | null;
 export declare const CREDENTIAL_RE: RegExp;
 /** 返回命中的凭据片段（未命中 null） */
 export declare function findCredentialMatch(body: string): string | null;
-/** token/secret/api_key 弱信号检测（当前仅警告；M2 将升级为拒绝） */
-export declare function hasWeakCredentialSignal(body: string): boolean;
 export interface UpsertInput {
     key: string;
     value: string;
