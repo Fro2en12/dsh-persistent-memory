@@ -65,6 +65,32 @@ describe('M12 导出/恢复', () => {
     expect(readFileSync(join(dir, backups[0]), 'utf8')).toContain('旧值')
   })
 
+  it('S7：export 拒绝 UNC/设备路径', async () => {
+    const { fake } = setup({}, [{ id: 'a', key: 'rule.a', value: 'v', scope: 'global', tags: [], createdAt: '2026-09-17T00:00:00.000Z', updatedAt: '2026-09-17T00:00:00.000Z' }])
+    const r = await cmd(fake)('export ' + '\\\\server\\share\\out.json')
+    expect(r.kind).toBe('error')
+    expect(r.text).toMatch(/UNC|设备路径/)
+  })
+
+  it('S7：restore 拒绝 UNC/设备路径', async () => {
+    const { fake } = setup()
+    const r = await cmd(fake)('restore ' + '\\\\server\\share\\in.json')
+    expect(r.kind).toBe('error')
+    expect(r.text).toMatch(/UNC|设备路径/)
+    expect((await fake.toolDefs.get('memory_stats').execute({})).total).toBe(0)
+  })
+
+  it('S7：restore 拒绝超过 2MB 的导入文件（库不被改动）', async () => {
+    const { fake, dir } = setup()
+    const big = join(dir, 'big-export.json')
+    // 合法 JSON 结构但超过 2MB
+    writeFs(big, JSON.stringify({ version: 1, items: [{ id: 'x', key: 'rule.x', value: 'a'.repeat(2 * 1024 * 1024 + 64), scope: 'global', tags: [], createdAt: 't', updatedAt: 't' }] }), 'utf8')
+    const r = await cmd(fake)('restore ' + big)
+    expect(r.kind).toBe('error')
+    expect(r.text).toMatch(/字节上限/)
+    expect((await fake.toolDefs.get('memory_stats').execute({})).total).toBe(0)
+  })
+
   it('非法恢复文件报错而非写库', async () => {
     const { fake, dir } = setup()
     const bad = join(dir, 'bad.json')
