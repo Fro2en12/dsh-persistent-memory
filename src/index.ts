@@ -17,15 +17,29 @@ import type { Context } from 'cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
+import { KEY_PREFIX_LIST, KEY_PREFIX_WHITELIST } from './types.js'
+import type { MemoryItem } from './types.js'
+import { sanitizeValue } from './sanitize.js'
+import {
+  ageLabel,
+  contentSimilarity,
+  fitBudget,
+  lexicalHit,
+  pickRecallItems,
+  rrfRanking,
+  semanticOverlap,
+  truncate,
+  type RecallEnv,
+  type ScoreEnv,
+} from './recall.js'
+import { detectCredentials, hasWeakCredentialSignal, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
+import { parseImportEntries } from './import.js'
+import { createStore, type StoreFileHandle, type StoreFs } from './store.js'
 
 export const name = '@dsh-external/dsh-persistent-memory'
 export const inject = ['tools', 'commands', 'settings']
 
-// ── 分类白名单：守则文本 / 错误消息同源，防止提示词与实现漂移 ──
-/** key 前缀白名单（memory_set 硬校验的唯一真相） */
-const KEY_PREFIX_WHITELIST = ['user', 'rule', 'task', 'ref', 'env', 'project', 'tool', 'auth', 'lesson', 'plugin']
-/** 前缀清单展示串：守则文本与错误消息共用 */
-const KEY_PREFIX_LIST = KEY_PREFIX_WHITELIST.join('/')
+
 
 export interface Config {
   /** 记忆库目录；缺省为 $DSH_HOME/dsh-persistent-memory */
@@ -111,22 +125,7 @@ export const Config = z.object({
   autoExtractCooldownMs: z.number().default(120 * 1000),
 })
 
-interface MemoryItem {
-  id: string
-  key: string
-  /** 简短摘要：自动召回与搜索只展示它，控制 token */
-  value: string
-  /** 可选完整正文：memory_get(includeFull) 才返回 */
-  full?: string
-  /** 可选关联记忆 key（同 scope）：召回时以关联行提示 */
-  links?: string[]
-  scope: string
-  tags: string[]
-  createdAt: string
-  updatedAt: string
-  /** 写入来源引证（日期+会话 id），v0.1.9 起 memory_set 自动填 */
-  source?: string
-}
+
 
 export function apply(ctx: Context, config: Config): void {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -180,57 +179,19 @@ export function apply(ctx: Context, config: Config): void {
     return run
   }
 
-  // 文件级缓存：stat（mtime+size）未变时复用解析结果，避免每轮 pre-step 重复读盘
-  let itemsCache: { mtimeMs: number; size: number; items: MemoryItem[] } | null = null
-
-  async function readItems(): Promise<MemoryItem[]> {
-    let st: Awaited<ReturnType<typeof fs.stat>>
-    try {
-      st = await fs.stat(dataFile)
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
-      throw err
-    }
-    if (itemsCache && itemsCache.mtimeMs === st.mtimeMs && itemsCache.size === st.size) {
-      return itemsCache.items
-    }
-    let text: string
-    try {
-      text = await fs.readFile(dataFile, 'utf8')
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
-      throw err
-    }
-    const items: MemoryItem[] = []
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      try {
-        const parsed = JSON.parse(trimmed) as MemoryItem
-        // 兼容历史/手工写入的缺字段记录：tags 缺失会令下游 item.tags.includes/map 抛 TypeError，
-        // 进而使整个自动召回被外层 catch 静默吞掉（违背"忽略损坏行防崩溃"目标）。
-        if (parsed && typeof parsed.key === 'string') {
-          if (!Array.isArray(parsed.tags)) parsed.tags = []
-          items.push(parsed)
-        }
-      } catch {
-        // 忽略损坏行，保证插件不因单条坏数据崩溃
-      }
-    }
-    itemsCache = { mtimeMs: st.mtimeMs, size: st.size, items }
-    return items
+  // 文件级缓存与读写实现已提取到 store.ts（fs 可注入，便于故障注入测试）
+  const storeFs: StoreFs = {
+    stat: (p) => fs.stat(p),
+    readFile: (p) => fs.readFile(p, 'utf8'),
+    mkdir: (p, o) => fs.mkdir(p, o),
+    writeFile: (p, b) => fs.writeFile(p, b, 'utf8'),
+    open: (p, f) => fs.open(p, f).then((fh) => fh as unknown as StoreFileHandle),
+    rename: (a, b) => fs.rename(a, b),
+    copyFile: (a, b) => fs.copyFile(a, b),
   }
-
-  function invalidateCache(): void {
-    itemsCache = null
-  }
-
-  async function writeItems(items: MemoryItem[]): Promise<void> {
-    await fs.mkdir(dataDir, { recursive: true })
-    const body = items.map((item) => JSON.stringify(item)).join('\n') + '\n'
-    await fs.writeFile(dataFile, body, 'utf8')
-    invalidateCache()
-  }
+  const store = createStore({ fs: storeFs, dataDir, dataFile, defaultScope })
+  const readItems = (): Promise<MemoryItem[]> => store.readItems()
+  const writeItems = (items: MemoryItem[]): Promise<void> => store.writeItems(items)
 
   // 检索公共实现：memory_search 工具与 /memory recall 命令共用
   async function searchItems(options: {
@@ -240,7 +201,7 @@ export function apply(ctx: Context, config: Config): void {
     limit?: number
   }): Promise<{ count: number; items: MemoryItem[] }> {
     const query = String(options.query || '').trim().toLowerCase()
-    const scopeFilter = options.scope ? normalizeScope(options.scope) : undefined
+    const scopeFilter = options.scope ? normalizeScope(options.scope, defaultScope) : undefined
     const tagsFilter = normalizeTags(options.tags)
     const limit = Math.max(1, Math.min(100, Number(options.limit) || maxResults))
     return withLock(async () => {
@@ -258,10 +219,7 @@ export function apply(ctx: Context, config: Config): void {
     })
   }
 
-  function normalizeScope(scope?: string): string {
-    const s = (scope || defaultScope).trim()
-    return s || 'global'
-  }
+
 
   function normalizeTags(tags?: string[]): string[] {
     if (!Array.isArray(tags)) return []
@@ -332,137 +290,34 @@ export function apply(ctx: Context, config: Config): void {
     return workspaceScopesCache
   }
 
-  // ③ 同义词表：扩展 token，弥补字面匹配的语义盲区（代理↔梯子↔vpn 等）
-  const SYNONYM_GROUPS: string[][] = [
-    ['代理', '梯子', 'vpn', 'proxy', 'clash', '加速器'],
-    ['认证', '登录', '登陆', '鉴权', 'auth', 'login', 'signin'],
-    ['凭据', '密钥', '密码', 'token', 'apikey', 'api-key', 'secret', 'credential'],
-    ['网络', '联网', '断网', '不通', 'network', 'net'],
-    ['超时', 'timeout', '卡住', '无响应', '挂起'],
-    ['失败', '报错', '错误', 'error', 'fail', 'exception', '崩溃'],
-    ['插件', 'plugin', '扩展', 'extension'],
-    ['记忆', 'memory', '上下文', 'context'],
-    ['权限', 'permission', '授权', 'authorization'],
-  ]
-  // ③b 低信息量词表：语气词/泛化词/高频噪音词。命中这些的 token 不参与评分与同义展开，
-  //     避免"看看/感觉/还是/降低"这类句内杂词把无关记忆抬上分（如"记忆/上下文"泛命中）。
-  const NOISE_WORDS = [
-    '看看', '弄一下', '搞一下', '这个', '那个', '感觉', '还是', '正常', '使用', '可以', '怎么', '什么',
-    '能不能', '降低', '影响', '同样', '经常', '一直', '老是', '为什么', '帮我', '我们', '咱们', '别人',
-    '东西', '事情', '时候', '现在', '今天', '目前', '之前', '之后', '最后', '然后', '但是', '而且',
-    '因为', '所以', '如果', '只是', '可能', '应该', '需要', '想要', '希望', '就是', '不是', '谢谢',
-    '麻烦', '顺便', '对了', '好的', '一下', '有点', '一些', '什么', '怎么', '如何', '是否', '并且',
-    '还有', '以及', '就是', '而已', '啊', '吧', '吗', '呢', '的', '了', '嗯', '哦', '哟', '喂',
-    'ai', 'llm', 'gpt', 'api', 'ui', 'go', 'ts', 'js', 'ok', 'okay', '好的啊',
-  ]
-  // ③c 弱信息词：粗粒度主题词。命中时只给低分且不做同义展开（"记忆/上下文/插件"太宽，
-  //     直接匹配会拉入大量环境记忆），防止 dsh-web-profile 类全局杂项污染注入。
-  const WEAK_WORDS = [
-    '记忆', '上下文', '插件', '扩展', '工具', '环境', '代理', '网络', '问题', '建议', '帮助',
-    '处理', '解决', '修复', '测试', '运行', '执行', '继续', '开始', '查看', '检查', '文件',
-    '命令', '配置', '设置', '项目', '状态', '记录', '内容', '数据',
-  ]
+  // 召回评分环境：把 apply 闭包内的运行时开关注入提取后的纯函数（recall.ts）
+  const scoreEnv = (): ScoreEnv => ({ synonymExpansion, taskTtlDays, workspaceScopes: currentWorkspaceScopes() })
+  const recallEnv = (): RecallEnv => ({
+    ...scoreEnv(),
+    autoRecallScope,
+    minScore: autoRecallMinScore,
+    relativeFloor: autoRecallRelativeFloor,
+    rrfRecall,
+    rrfFirstTurnOnly,
+  })
 
-  function stripNoise(token: string): string {
-    let s = token.toLowerCase()
-    for (const w of NOISE_WORDS) s = s.split(w).join('')
-    return s
-  }
 
-  function expandToken(token: string): string[] {
-    // 长 token（整句/跨词块）不做同义展开：避免"看看我自己做的记忆插件"整串命中
-    // `插件` 组从而把 9 组同义词全部带入评分（0.1.2 误召回的主要来源）。
-    if (token.length > 6) return [token]
-    const out = [token]
-    for (const group of SYNONYM_GROUPS) {
-      if (group.some((w) => token.includes(w) || w.includes(token))) out.push(...group)
-    }
-    return [...new Set(out)]
-  }
 
-  // ⑤ 记忆投毒防护：召回注入前清洗 value（控制字符 / 非 http URI scheme / 提示注入模式）
-  function sanitizeValue(value: string): string {
-    let v = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-    // 中和非 http(s) 的 xxx:// scheme（viking://、file://、javascript: 等投毒向量），不影响 E:/ 路径
-    v = v.replace(/\b(?!https?:)([a-z][a-z0-9+.\-]{2,}):\/\//gi, (m) => m.replace(':', '\u02d0'))
-    // 中和无 // 的危险 scheme：javascript:、data:、vbscript: 等（旧正则只覆盖 xxx:// 形式）
-    v = v.replace(/\b(?:javascript|vbscript|data|file|blob):/gi, (m) => m.replace(':', '\u02d0'))
-    // 打断疑似提示注入指令
-    v = v.replace(
-      /(ignore\s+(all\s+)?(previous|prior|above)\s+instructions?|忽略(之前|以上|前面)(的)?(所有)?指令|system\s*prompt\s*:|disregard\s+(all\s+)?(previous|prior)\s+.*?instructions?)/gi,
-      '[已过滤可疑指令文本]',
-    )
-    return v
-  }
 
-  // ④ key 相似度（词元重叠率），用于 memory_set 去重合并
-  function keySimilarity(a: string, b: string): number {
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ').trim().split(/\s+/).filter(Boolean)
-    const ta = norm(a)
-    const tb = norm(b)
-    if (!ta.length || !tb.length) return 0
-    const setB = new Set(tb)
-    const overlap = ta.filter((t) => setB.has(t)).length
-    return overlap / Math.max(ta.length, tb.length)
-  }
 
-  // ④b 语义辅助（v0.1.9）：中文二元组 + 英文词元，零 token 零依赖
-  function tokenizeForSemantic(s: string): string[] {
-    const cleaned = s.toLowerCase().replace(/\s+/g, ' ')
-    const tokens: string[] = []
-    const cn = cleaned.match(/[一-鿿]+/g) || []
-    for (const run of cn) {
-      if (run.length === 1) tokens.push(run)
-      else for (let i = 0; i < run.length - 1; i++) tokens.push(run.slice(i, i + 2))
-    }
-    const en = cleaned.replace(/[一-鿿]+/g, ' ').match(/[a-z0-9][a-z0-9._-]*/g) || []
-    tokens.push(...en.filter((t) => t.length > 1))
-    return tokens
-  }
 
-  function bigramJaccard(a: string, b: string): number {
-    const ta = tokenizeForSemantic(a)
-    const tb = tokenizeForSemantic(b)
-    if (!ta.length || !tb.length) return 0
-    const setB = new Set(tb)
-    const overlap = ta.filter((t) => setB.has(t)).length
-    return overlap / (ta.length + tb.length - overlap)
-  }
 
-  // RRF 补位的语义交集门槛（v0.1.21）：查询与条目共享多少个中文二元组/英文词元。
-  // RRF 是相对排名，小记忆库里最坏排名也能过 0.025（库 ≤21 条时任何条目都过线），
-  // 只靠它补位 = 库里有货就塞满配额、与查询无关。补位必须真的沾边。
-  function semanticOverlap(query: string, text: string): number {
-    const q = tokenizeForSemantic(query)
-    const t = new Set(tokenizeForSemantic(text))
-    return q.filter((token) => t.has(token)).length
-  }
 
-  // RRF 倒数排名融合：词法分 + bigram 相似度双排名（对标 dsh-evolve 的零 token 混合召回）
-  function rrfRanking(items: MemoryItem[], query: string): { item: MemoryItem; rrf: number }[] {
-    if (!query || items.length === 0) return []
-    const lex = items.map((item) => ({ item, s: scoreItem(item, query, false) }))
-    const bi = items.map((item) => ({ item, s: bigramJaccard(query, `${item.key} ${item.value}`) }))
-    const rankMap = (arr: { item: MemoryItem; s: number }[]) => {
-      const sorted = [...arr].sort((a, b) => b.s - a.s)
-      return new Map(sorted.map((e, i) => [e.item.id, i]))
-    }
-    const lexRank = rankMap(lex)
-    const biRank = rankMap(bi)
-    const K = 60
-    return items
-      .map((item) => {
-        const r1 = lexRank.get(item.id) ?? items.length
-        const r2 = biRank.get(item.id) ?? items.length
-        return { item, rrf: 1 / (K + r1) + 1 / (K + r2) }
-      })
-      .sort((a, b) => b.rrf - a.rrf)
-  }
 
-  // 内容冲突检测（v0.1.9）：key 相似与 value 语义相似取高者
-  function contentSimilarity(a: MemoryItem, b: MemoryItem): number {
-    return Math.max(bigramJaccard(a.value, b.value), keySimilarity(a.key, b.key))
-  }
+
+
+
+
+
+
+
+
+
 
   // ── 自动召回：把相关/最近记忆注入到每轮请求前 ─────────────────────────
   // v0.1.4：只读文本、跳过插件注入消息、向后取最多 2 条用户文本消息（上下文延续如
@@ -493,80 +348,9 @@ export function apply(ctx: Context, config: Config): void {
     return { query: texts.join(' ').slice(0, 200), hasImage }
   }
 
-  function queryTokens(query: string): string[] {
-    const tokens = query.toLowerCase().split(/[\s,，。.!！?？:：;；、/\\()[\]{}"']+/).filter(Boolean)
-    return tokens.length > 0 ? tokens.slice(0, 12) : [query.toLowerCase()]
-  }
 
-  function scoreItem(item: MemoryItem, query: string, isFirstTurn: boolean): number {
-    if (!query) return 0
-    const q = query.toLowerCase()
-    const tokens = queryTokens(query)
-    let score = 0
-    const key = item.key.toLowerCase()
-    const value = item.value.toLowerCase()
-    const scope = item.scope.toLowerCase()
-    const tags = item.tags.map((tag) => tag.toLowerCase())
 
-    // ② 工作区感知：项目专属 scope 与当前工作区无关 → 首轮直接排除，非首轮降权；
-    //    命中当前工作区 → 加权（global 不加不减）
-    const wsScopes = currentWorkspaceScopes()
-    const inCurrentWorkspace = scope === 'global'
-      || wsScopes.some((ws) => scope.includes(ws) || ws.includes(scope))
-    if (!inCurrentWorkspace) {
-      if (isFirstTurn) return 0
-      score -= 4
-    } else if (scope !== 'global') {
-      score += 4
-    }
 
-    for (const token of tokens) {
-      // 噪声词：剔除 NOISE_WORDS 后几乎没有剩余 → 语气/泛化 token，不参与评分
-      //（避免"看看/感觉/还是…"这类句内杂词把无关记忆抬上分）
-      const stripped = stripNoise(token)
-      if (stripped.length < 2 && token.length < 8) continue
-
-      const isWeak = WEAK_WORDS.some((w) => token.includes(w))
-      if (key.includes(token)) {
-        score += key === token ? 9 : 5
-      } else if (value.includes(token)) {
-        score += isWeak ? 1 : 2
-      } else if (synonymExpansion && !isWeak && token.length <= 6) {
-        // ③ 同义词扩展：仅短 token（≤6 字符）展开，且只作用于 key/tags（value 太宽泛，易误命中）
-        const synonyms = expandToken(token).filter((w) => w !== token)
-        if (synonyms.some((w) => key.includes(w))) score += 2
-        else if (synonyms.some((w) => tags.some((tag) => tag.includes(w)))) score += 1
-      }
-      if (scope.includes(token)) score += 1
-      if (tags.some((tag) => tag.includes(token) || token.includes(tag))) score += 2
-    }
-
-    // ⑥ 画像式分层修正：user.* 是稳定画像（用户偏好/禁忌），首轮应优先注入而非降权——
-    //    "犯同样错"的常见根因正是首轮不知道用户约定（如 pwsh 7、非 C 盘）→ 改为 +1
-    if (key.startsWith('user.') && isFirstTurn) score += 1
-
-    // ⑦ task.* 保鲜期（v0.1.16）：任务状态变化快，超期记忆降权而非删除——
-    //    "30 天前的任务进展"几乎不可能是现状，但作为历史仍有查询价值。
-    if (key.startsWith('task.')) {
-      const ageDays = Math.floor((Date.now() - Date.parse(item.updatedAt)) / 86_400_000)
-      if (Number.isFinite(ageDays) && ageDays > taskTtlDays) score -= 3
-    }
-
-    // 信号词扩展：仅在非首轮启用，避免首轮被大量无关记忆污染
-    if (!isFirstTurn) {
-      const SIGNAL_WORDS = [
-        '网络', '代理', 'proxy', 'vpn', 'clash', '梯子', 'github', 'git', 'ssh',
-        '超时', '失败', '不通', '连不上', '认证', '权限', '凭据', '环境', '工具',
-      ]
-      if (SIGNAL_WORDS.some((word) => q.includes(word))) {
-        const signalInItem = SIGNAL_WORDS.some((word) =>
-          key.includes(word) || value.includes(word) || tags.some((tag) => tag.includes(word)),
-        )
-        if (signalInItem) score += 2
-      }
-    }
-    return score
-  }
 
   // 规则/教训通道：识别"又犯同样错"的悔恨信号与"路径/终端/命令"类场景信号。
   // 这两类信号触发时，强制召回 rule.*/教训/坑/修复类记忆（不受 autoRecallOnce 限制）。
@@ -601,19 +385,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // 教训通道的轻量词法命中：与 scoreItem 同源的噪声/弱词规则，但去掉工作区加分与
   // 同义词扩展——只回答「这条记忆里是否真的出现了 query 的词」。
-  function lexicalHit(item: MemoryItem, query: string): boolean {
-    const key = item.key.toLowerCase()
-    const value = item.value.toLowerCase()
-    const tags = item.tags.map((tag) => tag.toLowerCase())
-    return queryTokens(query).some((token) => {
-      const stripped = stripNoise(token)
-      if (stripped.length < 2 && token.length < 8) return false
-      const isWeak = WEAK_WORDS.some((w) => token.includes(w))
-      if (key.includes(token)) return true
-      if (value.includes(token) && !isWeak) return true
-      return tags.some((tag) => tag.includes(token) || token.includes(tag))
-    })
-  }
+
   function pickLessonItems(items: MemoryItem[], query: string, isRegret: boolean, isRule: boolean, limit: number): MemoryItem[] {
     const candidates = items.filter((item) => isLessonLike(item))
     if (candidates.length === 0) return []
@@ -635,81 +407,21 @@ export function apply(ctx: Context, config: Config): void {
     return relevant.slice(0, limit).map((entry) => entry.item)
   }
 
-  function pickRecallItems(
-    items: MemoryItem[],
-    query: string,
-    limit: number,
-    useFallback: boolean,
-    isFirstTurn: boolean,
-    hasImage: boolean,
-  ): MemoryItem[] {
-    const scoped = autoRecallScope ? items.filter((item) => item.scope === autoRecallScope) : items
-    if (scoped.length === 0) return []
-    const scored = scoped.map((item) => ({ item, score: scoreItem(item, query, isFirstTurn) }))
-    scored.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score
-      return b.item.updatedAt.localeCompare(a.item.updatedAt)
-    })
-    // 阈值（v0.1.17）：绝对下限 + 相对比例组合。
-    // - 绝对下限挡住"整体都不相关"（所有候选分数都低时全部过滤，宁可不注入）；
-    // - 相对比例只留与最佳匹配同量级的，挡住"矮子里拔将军"（top1 自己也低时仍会被注入）。
-    // 首轮仍用固定 6（一次 key 直中 + 少量辅助，防止弱词/同义把无关记忆抬上分）。
-    const minScore = isFirstTurn ? 6 : autoRecallMinScore
-    const best = scored.length > 0 ? scored[0].score : 0
-    const relativeFloor = (!isFirstTurn && autoRecallRelativeFloor > 0 && best > 0)
-      ? best * autoRecallRelativeFloor
-      : 0
-    const floor = Math.max(minScore, relativeFloor)
-    const top = scored.filter((entry) => entry.score >= floor).map((entry) => entry.item)
-    // 画像兜底已移除（v0.1.6）：首轮 0 命中改由 pre-step 的【记忆索引】块兜底，user.* 画像在其中自然呈现。
-    if (top.length >= limit) return top.slice(0, limit)
-    // v0.1.9 RRF 语义补位：词法 0 命中时，用词法+二元组双排名召回语义相关条目（零 token）
-    if (rrfRecall && (!rrfFirstTurnOnly || isFirstTurn) && top.length === 0 && query) {
-      // 补位也必须真的沾边：共享中文二元组/英文词元才算相关。
-      // 首轮更严（注入无关记忆的注意力代价最高），非首轮放宽到 1。
-      const minOverlap = isFirstTurn ? 2 : 1
-      const ranked = rrfRanking(scoped, query).filter((e) => {
-        if (e.rrf < 0.025) return false
-        return semanticOverlap(query, `${e.item.key} ${e.item.value}`) >= minOverlap
-      })
-      if (ranked.length > 0) return ranked.slice(0, limit).map((e) => e.item)
-    }
-    // 首轮不启用 fallback，避免用"最近记忆"凑数
-    if (!useFallback || isFirstTurn) return top
-    const picked = new Set(top.map((item) => `${item.scope}\u0000${item.key}`))
-    const recent = [...scoped]
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .filter((item) => !picked.has(`${item.scope}\u0000${item.key}`))
-    return [...top, ...recent.slice(0, limit - top.length)]
-  }
+
 
   // 重排候选池（v0.1.9）：RRF 双排名取 top max——词法零命中但语义相关的条目也能进 LLM 重排视野
   function pickRecallCandidates(items: MemoryItem[], query: string, max: number): MemoryItem[] {
     if (!query) return []
-    const ranked = rrfRanking(items, query).filter((e) => e.rrf >= 0.025)
+    const ranked = rrfRanking(items, query, scoreEnv()).filter((e) => e.rrf >= 0.025)
     return ranked.slice(0, max).map((e) => e.item)
   }
 
-  // 在句子边界（。；！？/换行/空格）截断，避免"…dsh-file-…"这种半截文字
-  function truncate(text: string, max: number): string {
-    if (text.length <= max) return text
-    const slice = text.slice(0, max)
-    const boundary = Math.max(
-      slice.lastIndexOf('。'), slice.lastIndexOf('；'), slice.lastIndexOf('！'),
-      slice.lastIndexOf('？'), slice.lastIndexOf('\n'), slice.lastIndexOf('. '),
-    )
-    return boundary > max * 0.5 ? `${slice.slice(0, boundary + 1)}…` : `${slice}…`
-  }
+
 
   // ── 记忆新鲜度（借鉴 Claude Code memoryAge.ts）────────────────────────
   // 天龄显示：今天/昨天/N 天前。模型对原始 ISO 时间戳的"过期感"很差，
   // "47 天前"比 ISO 串更能触发过期推理。
-  function ageLabel(iso: string): string {
-    const d = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 86_400_000))
-    if (!Number.isFinite(d) || d === 0) return '今天'
-    if (d === 1) return '昨天'
-    return `${d} 天前`
-  }
+
 
   // 漂移警告：>1 天的记忆附"时点观察"提示——记忆是写入时的真相，不是实时状态；
   // 点名了文件/路径/命令的记忆在引用前先验证（否则"过时断言当事实"正是重复犯错之源）。
@@ -730,22 +442,10 @@ export function apply(ctx: Context, config: Config): void {
     return `\n> ⚠️ 以上 ${ages.length} 条为 ${oldest} 天前的时点观察，可能已过时：点名的文件/路径/命令引用前先验证现状；与现状冲突时以现状为准，并更新该记忆。`
   }
 
-  // 注入预算裁剪（v0.1.16）：条数上限管不住"每条都很长"，按分数顺序累计，
-  // 超出 autoRecallBudgetChars 的条目直接丢弃——宁少勿多，无关占位比留白更贵。
-  function fitBudget(items: MemoryItem[], budget: number): MemoryItem[] {
-    const kept: MemoryItem[] = []
-    let used = 0
-    for (const item of items) {
-      const cost = Math.min(sanitizeValue(item.value).length, autoRecallMaxChars) + item.key.length + 48
-      if (kept.length > 0 && used + cost > budget) break
-      kept.push(item)
-      used += cost
-    }
-    return kept
-  }
+
 
   function formatRecall(items: MemoryItem[], all: MemoryItem[]): string {
-    const fitted = fitBudget(items, autoRecallBudgetChars)
+    const fitted = fitBudget(items, autoRecallBudgetChars, autoRecallMaxChars, sanitizeValue)
     const lines = fitted.map((item) => {
       // ⑤ 投毒防护：注入前清洗（控制字符/危险 URI scheme/提示注入模式）
       const cleaned = sanitizeValue(item.value)
@@ -765,7 +465,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   function formatLesson(items: MemoryItem[]): string {
-    const fitted = fitBudget(items, autoRecallBudgetChars)
+    const fitted = fitBudget(items, autoRecallBudgetChars, autoRecallMaxChars, sanitizeValue)
     const lines = fitted.map((item) => {
       const cleaned = sanitizeValue(item.value)
       return `- [${item.scope}/${item.key} · ${ageLabel(item.updatedAt)}${item.source ? ` · 自${item.source}` : ''}] ${truncate(cleaned, autoRecallMaxChars)}`
@@ -1260,7 +960,7 @@ export function apply(ctx: Context, config: Config): void {
               : all
             if (items.length > 0) {
               const isFirstTurn = payload.step === 1
-              const recalled = pickRecallItems(items, query, autoRecallLimit, autoRecallFallback, isFirstTurn, hasImage)
+              const recalled = pickRecallItems(items, query, autoRecallLimit, autoRecallFallback, isFirstTurn, hasImage, recallEnv())
               // LLM 语义重排（v0.1.6）：词法命中候选 ≥1 且启用时，用 LLM 挑"明确有用"的条
               let recalledItems = recalled
               if (autoRecallRerank && query && !hasImage && recalled.length > 0) {
@@ -1390,7 +1090,7 @@ export function apply(ctx: Context, config: Config): void {
       if (approveOnSet && args.confirmed !== true) {
         throw new Error('memory_set: 已开启写入审批（approveOnSet）。请先向用户确认是否记录这条记忆（直接询问或 ask_user_question），用户同意后带 confirmed: true 重试本次写入。')
       }
-      const scope = normalizeScope(args.scope)
+      const scope = normalizeScope(args.scope, defaultScope)
       // 硬层隔离（v0.1.6）：子代理禁止写 global 记忆（软层只读守则 + 此处拒绝双保险）
       if (isSubagentAgent(exec?.agent) && scope === 'global') {
         const subId = String(exec?.agent?.session?.id ?? 'unknown')
@@ -1409,20 +1109,17 @@ export function apply(ctx: Context, config: Config): void {
         full = full ? `${full}\n\n${raw}` : raw
         warnings.push(`value 摘要 ${raw.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
       }
-      // ── 写侧闸门（v0.1.7）：实测闸门；文案与守则同源（KEY_PREFIX_LIST 在模块顶部）──
+      // ── 写侧闸门（v0.1.7）：实测闸门；文案与守则同源（KEY_PREFIX_LIST 见 types.ts / write-gate.ts）──
+      validateKeyPrefix(key, scope)
       const prefix = key.split('.')[0]
-      if (!KEY_PREFIX_WHITELIST.includes(prefix) && prefix !== scope) {
-        throw new Error(`memory_set: key 前缀 "${prefix}" 不在分类白名单（${KEY_PREFIX_LIST}）。项目专属记忆请把项目名写进 scope 参数、key 前缀用标准分类（如 task.xxx 配 scope=项目名）；确需项目名前缀时 scope 须与 key 前缀一致。`)
-      }
       if (tags.length > 3) {
         throw new Error(`memory_set: tags 最多 3 个（当前 ${tags.length} 个）。请收敛到最能代表内容的 1-3 个标签。`)
       }
       if (prefix !== 'auth') {
         const body = `${args.value}\n${args.full ?? ''}`
-        if (/password|passwd|密码|口令|密钥/i.test(body)) {
-          throw new Error('memory_set: 检测到疑似明文密码/密钥。凭据类记忆请用 auth.* 前缀（用户授权保留）；其他前缀一律只记指针（去哪查），不记明文。')
-        }
-        if (/token|secret|api[_-]?key/i.test(body)) {
+        const credErr = detectCredentials(body)
+        if (credErr) throw new Error(credErr)
+        if (hasWeakCredentialSignal(body)) {
           warnings.push('内容含 token/secret 类关键词：请确认这是"去哪查"的指针而非明文凭据')
         }
       }
@@ -1436,51 +1133,25 @@ export function apply(ctx: Context, config: Config): void {
       const source = (args.source || '').trim() || `${now.slice(0, 10)}${sessionId ? ` s=${sessionId.slice(0, 8)}` : ''}`
       return withLock(async () => {
         const items = await readItems()
-        let idx = items.findIndex((item) => item.scope === scope && item.key === key)
-        let created = false
-        let mergedKey = ''
-        // ④ 去重合并：同 scope 下 key 高度相似的旧条目视为同一条记忆，就地更新而非新建
-        if (idx < 0 && dedupeOnSet) {
-          const similar = items
-            .map((item, i) => ({ i, sim: item.scope === scope ? keySimilarity(item.key, key) : 0 }))
-            .filter((entry) => entry.sim >= 0.6)
-            .sort((a, b) => b.sim - a.sim)[0]
-          if (similar) {
-            idx = similar.i
-            mergedKey = items[idx].key
-          }
-        }
-        if (idx >= 0) {
-          const prev = items[idx]
-          items[idx] = {
-            ...prev,
-            value,
-            full: full !== undefined ? full : prev.full,
-            links: links.length ? links : prev.links,
-            tags: tags.length ? tags : prev.tags,
-            updatedAt: now,
-            source: (args.source || '').trim() ? source : prev.source,
-          }
-        } else {
-          // v0.1.9 内容冲突检测：同 scope 已有内容高度相似的条目 → 警告提示确认，不静默并存
-          const clash = items
-            .map((item, i) => ({
-              i,
-              sim: item.scope === scope
-                ? contentSimilarity(item, { key, value, scope, tags: [], id: '', createdAt: now, updatedAt: now } as MemoryItem)
-                : 0,
-            }))
-            .filter((entry) => entry.sim >= 0.55)
-            .sort((a, b) => b.sim - a.sim)[0]
-          if (clash) {
-            warnings.push(`与已有条目 ${scope}/${items[clash.i].key} 内容高度相似（${Math.round(clash.sim * 100)}%）：请确认是否应更新该条（memory_set 同 key）而非新建`)
-          }
-          items.push({ id: makeId(), key, value, full, links: links.length ? links : undefined, scope, tags, createdAt: now, updatedAt: now, source })
-          created = true
+        // ④ 去重合并 / 冲突检测 / push 新建：逻辑见 write-gate.ts 的 upsertMemory（与 M9 提取前逐字节等价）
+        const result = upsertMemory(items, {
+          key,
+          value,
+          full,
+          links,
+          tags,
+          scope,
+          createdAt: now,
+          updatedAt: now,
+          source,
+          explicitSource: Boolean((args.source || '').trim()),
+        }, { dedupe: dedupeOnSet, makeId })
+        if (result.clashKey !== undefined && result.clashSim !== undefined) {
+          warnings.push(`与已有条目 ${scope}/${result.clashKey} 内容高度相似（${Math.round(result.clashSim * 100)}%）：请确认是否应更新该条（memory_set 同 key）而非新建`)
         }
         await writeItems(items)
         if (sessionId) lastManualWriteAt.set(sessionId, Date.now())
-        return { ok: true, key, scope, created, mergedKey, updatedAt: now, ...(warnings.length ? { warnings } : {}) }
+        return { ok: true, key, scope, created: result.created, mergedKey: result.mergedKey, updatedAt: now, ...(warnings.length ? { warnings } : {}) }
       })
     },
   })), '@dsh-external/dsh-persistent-memory: memory_set')
@@ -1518,7 +1189,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: { key: string; scope?: string; includeFull?: boolean }) {
       const key = String(args.key || '').trim()
       if (!key) throw new Error('memory_get: key 不能为空')
-      const scope = normalizeScope(args.scope)
+      const scope = normalizeScope(args.scope, defaultScope)
       const includeFull = args.includeFull === true
       return withLock(async () => {
         const items = await readItems()
@@ -1618,7 +1289,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: { key: string; scope?: string }) {
       const key = String(args.key || '').trim()
       if (!key) throw new Error('memory_forget: key 不能为空')
-      const scope = normalizeScope(args.scope)
+      const scope = normalizeScope(args.scope, defaultScope)
       return withLock(async () => {
         const items = await readItems()
         const before = items.length
@@ -1679,7 +1350,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_args, value) => [{ type: 'text', text: value.summary }],
     },
     async execute(args: { scope?: string; maxItems?: number }) {
-      const scopeFilter = args.scope ? normalizeScope(args.scope) : ''
+      const scopeFilter = args.scope ? normalizeScope(args.scope, defaultScope) : ''
       const maxItems = Math.max(1, Math.min(50, Number(args.maxItems) || 20))
       return withLock(async () => {
         const items = await readItems()
@@ -1711,51 +1382,8 @@ export function apply(ctx: Context, config: Config): void {
   })), '@dsh-external/dsh-persistent-memory: memory_dream')
 
   // ── 记忆导入（v0.1.9）：CLAUDE.md / MEMORY.md / memories.json 一键入库 ──
-  function slugKey(s: string): string {
-    const cleaned = s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
-    return cleaned || 'item'
-  }
-  function parseImportEntries(raw: string, filePath: string): { key: string; value: string; full?: string; tags: string[] }[] {
-    const lower = filePath.toLowerCase()
-    if (lower.endsWith('.json')) {
-      let data: unknown
-      try { data = JSON.parse(raw) } catch { throw new Error(`memory_import: ${filePath} 不是合法 JSON`) }
-      const entries: { key: string; value: string; full?: string; tags: string[] }[] = []
-      const walk = (obj: unknown, prefix: string) => {
-        if (Array.isArray(obj)) { obj.forEach((v, i) => walk(v, `${prefix}-${i}`)); return }
-        if (obj && typeof obj === 'object') {
-          const o = obj as Record<string, unknown>
-          if (typeof o.value === 'string') {
-            entries.push({ key: `${prefix}.${slugKey(String(o.key ?? 'item'))}`, value: String(o.value), full: typeof o.full === 'string' ? o.full : undefined, tags: [] })
-          } else {
-            for (const [k, v] of Object.entries(o)) walk(v, `${prefix}.${slugKey(k)}`)
-          }
-        }
-      }
-      walk(data, 'import')
-      return entries
-    }
-    const blocks = raw.split(/\n\s*\n+/).map((b) => b.trim()).filter(Boolean)
-    const out: { key: string; value: string; full?: string; tags: string[] }[] = []
-    blocks.forEach((block, i) => {
-      const lines = block.split('\n').map((l) => l.trim()).filter(Boolean)
-      const heading = lines.find((l) => l.startsWith('#')) || ''
-      const body = lines.filter((l) => !l.startsWith('#')).join(' ')
-      const text = body || heading.replace(/^#+\s*/, '')
-      if (!text) return
-      const tag = heading.replace(/^#+\s*/, '').slice(0, 24)
-      let prefix = 'ref'
-      if (/必须|不要|禁止|一律|规则|默认|优先|纠正/i.test(text)) prefix = 'rule'
-      else if (/教训|坑|切记|注意/i.test(text)) prefix = 'lesson'
-      out.push({
-        key: `${prefix}.${slugKey(tag || `item${i + 1}`)}`,
-        value: text.length > valueMaxChars ? `${text.slice(0, valueMaxChars - 1)}…` : text,
-        full: text.length > valueMaxChars ? text : undefined,
-        tags: [],
-      })
-    })
-    return out
-  }
+
+
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_import',
     description: `把外部文件导入记忆库：CLAUDE.md / MEMORY.md / Claude Code memories.json 等。.json 按条目、.md/.txt 按段落切分，自动分配 ref/rule/lesson 前缀，value 截 ${valueMaxChars} 字余量入 full，与库中已有条目内容高度相似（≥70%）自动跳过。`,
@@ -1778,10 +1406,10 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: { path: string; scope?: string }) {
       const filePath = String(args.path || '').trim()
       if (!filePath) throw new Error('memory_import: path 必填')
-      const scope = normalizeScope(args.scope)
+      const scope = normalizeScope(args.scope, defaultScope)
       let raw: string
       try { raw = await fs.readFile(filePath, 'utf8') } catch { throw new Error(`memory_import: 无法读取 ${filePath}`) }
-      const entries = parseImportEntries(raw, filePath)
+      const entries = parseImportEntries(raw, filePath, { valueMaxChars })
       if (entries.length === 0) throw new Error(`memory_import: ${filePath} 没有可导入的内容`)
       return withLock(async () => {
         const items = await readItems()
@@ -1954,7 +1582,7 @@ export function apply(ctx: Context, config: Config): void {
         let raw: string
         try { raw = await fs.readFile(arg, 'utf8') } catch { return { kind: 'error', text: `无法读取文件：${arg}` } }
         let entries
-        try { entries = parseImportEntries(raw, arg) } catch (err) { return { kind: 'error', text: String(err instanceof Error ? err.message : err) } }
+        try { entries = parseImportEntries(raw, arg, { valueMaxChars }) } catch (err) { return { kind: 'error', text: String(err instanceof Error ? err.message : err) } }
         if (entries.length === 0) return { kind: 'error', text: `${arg} 没有可导入的内容。` }
         let imported = 0
         let skipped = 0
