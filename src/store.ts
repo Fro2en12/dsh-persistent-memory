@@ -194,6 +194,21 @@ export function createStore(opts: StoreOptions): MemoryStore {
    *  · 只有拿到 reap 文件（open 'wx' 独占）的进程才允许动 lockFile —— 同一时刻只有一个清除者；
    *  · unlink 前二次校验：mtime 仍超阈值 且 token 与判陈旧时读到的一致；任一项变化即放弃本轮；
    *  · lockFile 存在期间没有进程能 open('wx') 成功，因此临界区内的 unlink 不可能删到新锁。
+   *
+   * ── T9 残留窗口（已知且未关闭，故保留本方案而不是改 rename-claim）──────────────
+   * 二次校验把「删到新锁」压到亚毫秒窗口，但没有消灭它。触发条件（两个必须同时成立）：
+   *  ① 持锁者停摆 > LOCK_STALE_MS(10s)：心跳周期 LOCK_HEARTBEAT_MS(2.5s)，正常写入/慢盘都不可能
+   *     停摆这么久；真实成因是进程被整体挂起（笔记本休眠、VM pause、断点调试、整机内存冻结），
+   *     或刷新路径自身卡死 >10s（此时它也刷不动 mtime，锁确实已经不可用了）；
+   *  ② 该持锁者恰好在清除者的「第二次 stat 之后、unlink 之前」恢复心跳并成功刷新 mtime。
+   * 命中窗口：第二次 stat 与 unlink 之间只有 1 次 readFile（token 复核）+ 1 次 unlink，约 10^2 µs；
+   * 相对 2.5s 的心跳周期，单次恢复命中概率量级 ~10^-4，再乘上「停摆 >10s」本身的罕见性，
+   * 因此测试里从未自然复现（回归用例用注入的方式把刷新精确塞进该窗口，验证二次校验能救回）。
+   * 命中后果：清除者删掉活锁 → 持锁者继续 rename，而等待者 open('wx') 拿到新锁 → 双持有。
+   * 未关闭的原因：本方案没有原子的「比对并删除」，只有把锁改成 rename-claim（谁把 lockFile
+   * rename 成自己的唯一名字谁就赢）才能彻底消除该窗口；第四轮论证认为该窗口需要两个独立
+   * 罕见条件同时成立，风险量级低于 rename-claim 引入的新复杂度（多一类待清理的 claim 文件、
+   * 崩溃后的回收语义更绕），故保留现状并在此备案（回归用例见 tests/concurrency.spec.ts 的 T9 用例）。
    */
   async function clearStaleLock(): Promise<boolean> {
     let observed: StoreFsStat
@@ -382,7 +397,16 @@ export function createStore(opts: StoreOptions): MemoryStore {
   }
 
   async function writeItems(items: MemoryItem[]): Promise<void> {
-    const lock = await acquireWriteLock()
+    // T2 附（第五轮 A 组发现的残留）：拿不到锁时也要失效缓存——语义上「本次没写」，
+    // 但此刻另一进程很可能正在写盘；缓存虽由 size/mtime 校验兜底，仍存在「版本戳恰好相同」
+    // 的窄盲区，代价一行即可消除。
+    let lock: Awaited<ReturnType<typeof acquireWriteLock>>
+    try {
+      lock = await acquireWriteLock()
+    } catch (err) {
+      invalidateCache()
+      throw err
+    }
     // c) 心跳：慢盘/大库/进程被挂起后的恢复期间持续刷新锁 mtime，避免被判陈旧而抢锁
     const beat = setInterval(() => { void lock.refresh() }, LOCK_HEARTBEAT_MS)
     if (typeof (beat as { unref?: () => void }).unref === 'function') (beat as { unref: () => void }).unref()
