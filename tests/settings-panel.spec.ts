@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { apply } from '../src/index'
 import { cleanTempDir, findPluginMessages, makeFakeCtx, makeItem, makeTempDir, runPreStep, seedMemoryFile } from './helpers'
@@ -93,12 +93,44 @@ describe('M13 面板字段数三方一致', () => {
     expect(log).toMatch(/applies=live/)
   })
 
-  it('client.js 渲染 6 个开关（含 rrfFirstTurnOnly）', () => {
-    const client = readFileSync(join(__dirname, '..', 'src', 'client.js'), 'utf8')
-    const start = client.indexOf('const FIELDS')
-    const block = client.slice(start, client.indexOf('];', start) + 2)
-    for (const f of ['autoRecall', 'autoCapture', 'autoRecallRerank', 'rrfRecall', 'rrfFirstTurnOnly', 'approveOnSet']) {
-      expect(block).toContain('"' + f + '"')
+  const SWITCHES = ['autoRecall', 'autoCapture', 'autoRecallRerank', 'rrfRecall', 'rrfFirstTurnOnly', 'approveOnSet']
+
+  /** FIELDS 数组第一列 = 真正渲染成开关的字段名（不是可选文案里的字符串碰巧命中） */
+  function fieldsOf(label: string, code: string): string[] {
+    const start = code.indexOf('const FIELDS')
+    expect(start, label + ' 里找不到 const FIELDS 数组').toBeGreaterThanOrEqual(0)
+    const end = code.indexOf('];', start)
+    expect(end, label + ' 的 FIELDS 数组未闭合').toBeGreaterThan(start)
+    return [...code.slice(start, end).matchAll(/\[\s*"([^"]+)"/g)].map((m) => m[1])
+  }
+
+  function readClient(label: string, file: string): string {
+    expect(existsSync(file), label + ' 缺失：' + file + '。请先 pnpm build（构建产物必须与 src/client.js 同步）').toBe(true)
+    return readFileSync(file, 'utf8')
+  }
+
+  it('构建产物 lib/client.js 含全部 6 个开关，且与 src/client.js 的 FIELDS 一致', () => {
+    const libCode = readClient('构建产物 lib/client.js', join(__dirname, '..', 'lib', 'client.js'))
+    const srcCode = readClient('源码 src/client.js', join(__dirname, '..', 'src', 'client.js'))
+    const libFields = fieldsOf('构建产物 lib/client.js', libCode)
+    const srcFields = fieldsOf('源码 src/client.js', srcCode)
+
+    // ① 构建产物侧：6 个开关一个不少（漏一个 = 面板少一个开关，用户关不掉对应行为）
+    expect(libFields, '构建产物 lib/client.js 的 FIELDS 字段数不是 6：请先 pnpm build').toHaveLength(6)
+    for (const f of SWITCHES) {
+      expect(libFields, '构建产物 lib/client.js 缺少字段 ' + f + '：请先 pnpm build').toContain(f)
     }
+    // 反向：不得多出未知字段（多出来 = 面板渲染了 host 不认识的开关）
+    expect(new Set(libFields)).toEqual(new Set(SWITCHES))
+    // 6 个字段确实被渲染消费（避免"字段名在、渲染不读"）
+    expect(libCode).toContain('FIELDS.map(')
+    expect(libCode).toContain('__ModuleLoader__')
+
+    // ② 源码侧证据（第二份客户端实现，始终存在）
+    expect(srcFields).toHaveLength(6)
+    for (const f of SWITCHES) expect(srcFields, '源码 src/client.js 缺少字段 ' + f).toContain(f)
+
+    // ③ 产物与源码同步：不一致说明产物过期（线上跑的是旧面板）→ 请先 pnpm build
+    expect(libFields, 'lib/client.js 与 src/client.js 的 FIELDS 不一致：请先 pnpm build').toEqual(srcFields)
   })
 })

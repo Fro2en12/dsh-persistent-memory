@@ -96,13 +96,44 @@ describe('C5 auth.* 读取闸门 + 检索面限定', () => {
     expect(s.items[0].key).toBe('rule.sub-only')
   })
 
-  it('子代理 memory_search 结果排除 auth.* 条目', async () => {
+  // ⚠️ 区分度说明（第三轮复核）：本用例【不】覆盖 auth.* 过滤——子代理不传 scope 时
+  // src/index.ts:1522 把 allowedScopes 定为 ['sub:<id>', ...工作区]，global 里的 auth.probe
+  // 在到达 1527 的 auth.* 过滤之前就已被 allowedScopes 排除；删掉 auth.* 过滤本用例依旧全绿。
+  // 真正有区分度的是下面「显式 scope」那条对照用例。
+  it('子代理 memory_search 无 scope 时只返回子代理/工作区条目（auth.* 前置于 allowedScopes 已被排除）', async () => {
     const { fake } = setup()
     const setTool = fake.toolDefs.get('memory_set')
     await setTool.execute({ key: 'auth.probe', value: 'sk-1234567890abcdef', scope: 'global' }, MAIN)
     const searchTool = fake.toolDefs.get('memory_search')
     const s = await searchTool.execute({ query: 'probe' }, SUB)
     expect(s.count).toBe(0)
+    expect(s.items).toEqual([])
+  })
+
+  // 对照用例（第三轮复核要求：删掉 src/index.ts 的 auth.* 过滤必红）：
+  // 子代理【显式】传 scope:"global" → isSub && !args.scope 为假 → allowedScopes === undefined，
+  // global 条目会进入结果集（下面用非 auth.* 条目证明这一点），此时唯一把 auth.* 挡在外面的
+  // 就是 src/index.ts:1526-1529 的过滤。删掉它 → s.items 变成长度 2、含 auth.probe → 三条断言全红。
+  it('子代理显式 scope:"global"（allowedScopes 旁路）仍看不到 auth.*，非 auth.* 的 global 条目可见', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    await setTool.execute({ key: 'rule.global-visible', value: '全局可见内容', scope: 'global' }, MAIN)
+    await setTool.execute({ key: 'auth.probe', value: 'sk-1234567890abcdef', scope: 'global' }, MAIN)
+    const searchTool = fake.toolDefs.get('memory_search')
+
+    // ① 同一入参在主会话下两条都在（证明这两个条目确实落在 scope=global 且查询命中了它们）
+    const asMain = await searchTool.execute({ scope: 'global' }, MAIN)
+    expect(asMain.items.map((i: any) => i.key).sort()).toEqual(['auth.probe', 'rule.global-visible'])
+
+    // ② 子代理显式 scope=global：allowedScopes 旁路打开，非 auth.* 条目进结果集 = 旁路确实生效
+    const s = await searchTool.execute({ scope: 'global' }, SUB)
+    expect(s.items.map((i: any) => ({ key: i.key, scope: i.scope })), 'auth.* 未被掩码/过滤：allowedScopes 旁路下唯一防线是 auth.* 过滤').toEqual([
+      { key: 'rule.global-visible', scope: 'global' },
+    ])
+    expect(s.count).toBe(1)
+    expect(s.items.every((i: any) => !i.key.toLowerCase().startsWith('auth.'))).toBe(true)
+    // ③ 结果体里连 auth.* 的 key 名都不出现（目录里出现 key 本身就是线索）
+    expect(JSON.stringify(s)).not.toContain('auth.probe')
   })
 })
 

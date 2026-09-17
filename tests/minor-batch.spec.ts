@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync as writeFs } from 
 import { join } from 'node:path'
 import { apply } from '../src/index'
 import { rrfRanking, stripNoise, pickRecallItems } from '../src/recall'
-import { cleanTempDir, makeFakeCtx, makeTempDir } from './helpers'
+import { cleanTempDir, findPluginMessages, makeFakeCtx, makeTempDir, runPreStep } from './helpers'
 
 // P2-20 批量：m2 dream 正则 / m3 stripNoise 预编译 / m5 rrf 首轮透传 / m6 命令挂 effect /
 // m7 退出 flush / m8 panel 路径 / m9 full 覆盖与上限 / m12 scopes 原型安全 / n3 schema 哨兵 / n4 debug 日志
@@ -21,6 +21,13 @@ afterEach(() => {
   for (const d of tmpDirs.splice(0)) cleanTempDir(d)
 })
 const MAIN = { agent: { session: { id: 'main-1', header: { delegationDepth: 0 } }, options: { subagentDepth: 0 } } }
+// 明确的"主会话"形状（session.id + header + options 齐备、深度 0）→ 守则 form 为 memory-capture-guide
+function agentFor(sid: string) {
+  return { session: { id: sid, header: { delegationDepth: 0 } }, options: { subagentDepth: 0 } }
+}
+function payloadFor(sid: string, text: string) {
+  return { agent: agentFor(sid), messages: [{ role: 'user', content: [{ type: 'text', text }] }], step: 1, signal: undefined }
+}
 function daysAgo(n: number) { return new Date(Date.now() - n * 86_400_000).toISOString() }
 
 describe('m2 memory_dream 完成态正则锚定', () => {
@@ -69,14 +76,78 @@ describe('m6/m7 生命周期', () => {
   it('卸载时 flush 注入状态（session-injections.json 落盘）', async () => {
     const { fake, dir } = setup({ autoCapture: true })
     const flush = fake.effects.find((e: any) => e.name.includes('flush'))
-    expect(flush).toBeTruthy()
-    // 触发一次注入以产生状态，再调用卸载清理
-    fake.handlers.get('agent/pre-step')
-    await Promise.resolve()
-    if (typeof flush.cleanup === 'function') flush.cleanup()
-    await new Promise((r) => setTimeout(r, 300))
-    // 允许状态文件不存在（无注入时无需落盘），但清理函数必须存在且不抛错
-    expect(true).toBe(true)
+    expect(flush, '未注册 flush effect').toBeTruthy()
+    const cleanup = flush.cleanup
+    expect(typeof cleanup, 'flush effect 未返回清理函数').toBe('function')
+
+    // 真触发一次注入：新会话首轮注入记忆守则 → sessionInjections.set('<sid>:capture-guide', now)
+    const SID = 'sess-flush'
+    const decision = await runPreStep(fake.handlers, payloadFor(SID, '随便聊聊'))
+    expect(findPluginMessages(decision, 'memory-capture-guide'), '首轮未注入守则，注入状态无从产生').toHaveLength(1)
+
+    // 卸载清理必须在 500ms 去抖窗口内落盘：否则进程在窗口内退出即丢状态，重启后同一会话重复注入
+    const file = join(dir, 'session-injections.json')
+    const t0 = Date.now()
+    ;(cleanup as () => void)()
+    // 等到「文件存在且 JSON 完整可解析」为止：writeFile 先创建空文件再写内容，
+    // 只看 existsSync 会在文件已创建、内容未写完时读到空串（全量并发跑时实测踩到过）。
+    let state: any = null
+    const deadline = t0 + 450
+    for (;;) {
+      try {
+        state = JSON.parse(readFileSync(file, 'utf8'))
+        if (state && typeof state === 'object' && state.entries) break
+      } catch { /* 尚未落盘 / 写入中的半截 JSON：重试 */ }
+      if (Date.now() > deadline) break
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    const elapsed = Date.now() - t0
+    expect(state, 'flush 后 450ms 内 session-injections.json 未完整落盘（500ms 去抖窗口内状态会丢）').not.toBeNull()
+    expect(elapsed, '落盘耗时 ≥500ms：无法区分是 flush 还是去抖定时器写的').toBeLessThan(500)
+
+    expect(state.version).toBe(1)
+    expect(state.entries, 'entries 不是注入记录表').toBeTypeOf('object')
+    expect(Object.keys(state.entries)).toContain(SID + ':capture-guide')
+    expect(typeof state.entries[SID + ':capture-guide']).toBe('number')
+  })
+
+  it('注入状态有界淘汰：260 个会话后 entries 不超过上限 200', async () => {
+    const { fake, dir } = setup({ autoCapture: true })
+    const flush = fake.effects.find((e: any) => e.name.includes('flush'))
+    const cleanup = flush.cleanup as () => void
+    const N = 260
+    let injected = 0
+    for (let i = 0; i < N; i++) {
+      const d = await runPreStep(fake.handlers, payloadFor('sess-evict-' + i, '随便聊聊'))
+      injected += findPluginMessages(d, 'memory-capture-guide').length
+    }
+    // 每个新会话都必须真的注入过（否则下面的上限断言可能因"没塞够"而假绿）
+    expect(injected, '有会话未注入守则，淘汰断言的前提不成立').toBe(N)
+    cleanup()
+    const file = join(dir, 'session-injections.json')
+    // 等这次 flush 的写完成：以"最新会话的记录出现"为准（去抖定时器可能中途写过旧快照）
+    const deadline = Date.now() + 3000
+    let entries: Record<string, number> = {}
+    const lastKey = 'sess-evict-' + (N - 1) + ':capture-guide'
+    for (;;) {
+      try {
+        if (existsSync(file)) {
+          entries = JSON.parse(readFileSync(file, 'utf8')).entries ?? {}
+          if (entries[lastKey] !== undefined) break
+        }
+      } catch { /* 写入中的半截 JSON：重试 */ }
+      if (Date.now() > deadline) break
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    const keys = Object.keys(entries)
+    expect(entries[lastKey], '最新会话的注入记录丢失（淘汰方向反了）').toBeTypeOf('number')
+    expect(keys.length).toBeGreaterThan(0)
+    // 【实测 2026-09-17】当前实现给的是 201：src/index.ts 四处内联淘汰都是「先判 size>200 再 set」，
+    // 因此稳态是 201 条；同文件的 setBounded()（836-843）是「先 set 再 while(size>max) 删」→ 恰好 ≤200。
+    // 修复方向：四处改用 setBounded(sessionInjections, key, Date.now())。
+    // 260 个互不相同的会话键 → 淘汰后恰好停在上限（既验证上界也验证不是提前清空）
+    expect(keys.length, 'entries 上界应是 200').toBe(200)
+    expect(keys, '最旧的会话记录未被淘汰').not.toContain('sess-evict-0:capture-guide')
   })
 })
 
