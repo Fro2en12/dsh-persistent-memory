@@ -84,11 +84,13 @@ describe('M8 启动迁移历史数据', () => {
     writeFileSync(join(dir, 'memory.jsonl'), lines, 'utf8')
     const fake = makeFakeCtx()
     apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: false })
-    // 等迁移（启动异步）落盘
-    for (let i = 0; i < 40; i++) {
+    // 等迁移（启动异步）落盘 + warn 日志都就绪——写盘与日志之间没有原子性，
+    // 只等文件会出现「文件已迁移但 warn 还没打」的 flaky 窗口
+    for (let i = 0; i < 80; i++) {
       await new Promise((r) => setTimeout(r, 25))
       const raw = readFileSync(join(dir, 'memory.jsonl'), 'utf8')
-      if (raw.includes('"scope":"global"') && !raw.includes('"scope":"Global"')) break
+      const warned = fake.logs.some((l: any) => l.level === 'warn' && l.message.includes('scope'))
+      if (raw.includes('"scope":"global"') && !raw.includes('"scope":"Global"') && warned) break
     }
     const raw = readFileSync(join(dir, 'memory.jsonl'), 'utf8')
     expect(raw).not.toContain('"scope":"Global"')
