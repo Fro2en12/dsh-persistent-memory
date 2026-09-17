@@ -37,6 +37,11 @@ export interface RecallEnv extends ScoreEnv {
     rrfFirstTurnOnly: boolean;
 }
 export declare function pickRecallItems(items: MemoryItem[], query: string, limit: number, useFallback: boolean, isFirstTurn: boolean, hasImage: boolean, env: RecallEnv): MemoryItem[];
-export declare function fitBudget(items: MemoryItem[], budget: number, maxChars: number, sanitize: (s: string) => string): MemoryItem[];
+export declare function fitBudget(items: MemoryItem[], budget: number, maxChars: number, sanitize: (s: string) => string, opts?: {
+    atLeastOne?: boolean;
+}): {
+    kept: MemoryItem[];
+    used: number;
+};
 export declare function truncate(text: string, max: number): string;
 export declare function ageLabel(iso: string): string;

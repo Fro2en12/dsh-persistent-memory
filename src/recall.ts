@@ -270,16 +270,26 @@ export function pickRecallItems(
 }
 
 // 注入预算裁剪（v0.1.16）：按分数顺序累计，超出 budget 的条目直接丢弃——宁少勿多。
-export function fitBudget(items: MemoryItem[], budget: number, maxChars: number, sanitize: (s: string) => string): MemoryItem[] {
+// M11：返回 { kept, used } —— 调用方用 used 扣减会话级总预算（四通道串行分配）。
+export function fitBudget(
+  items: MemoryItem[],
+  budget: number,
+  maxChars: number,
+  sanitize: (s: string) => string,
+  opts: { atLeastOne?: boolean } = {},
+): { kept: MemoryItem[]; used: number } {
   const kept: MemoryItem[] = []
   let used = 0
+  // M11：会话级总预算耗尽（<=0）时直接返回空
+  if (budget <= 0) return { kept, used }
   for (const item of items) {
-    const cost = Math.min(sanitize(item.value).length, maxChars) + item.key.length + 48
-    if (kept.length > 0 && used + cost > budget) break
+    const cost = Math.min(sanitize(item.value).length, maxChars) + item.key.length + 64
+    // atLeastOne=false（受总预算约束的通道）：第一条也必须落在预算内，否则总预算被击穿
+    if (used + cost > budget && !(opts.atLeastOne !== false && kept.length === 0)) break
     kept.push(item)
     used += cost
   }
-  return kept
+  return { kept, used }
 }
 
 // 在句子边界（。；！？/换行/空格）截断，避免"…dsh-file-…"这种半截文字

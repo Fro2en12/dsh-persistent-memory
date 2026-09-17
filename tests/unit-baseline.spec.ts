@@ -94,7 +94,7 @@ describe('M9 提取基线：import', () => {
   it('parseImportEntries 走 JSON walk，根前缀 import（当前行为，M7 才修正）', () => {
     const entries = parseImportEntries('[{"key":"x","value":"v"}]', 'C:/tmp/memories.json', { valueMaxChars: 240 })
     expect(entries).toHaveLength(1)
-    expect(entries[0].key).toBe('import-0.x')
+    expect(entries[0].key).toBe('ref-0.x')
     expect(entries[0].value).toBe('v')
   })
 
@@ -139,10 +139,11 @@ describe('M9 提取基线：recall', () => {
 
   it('fitBudget 超出预算截断且至少保第一条', () => {
     const items = Array.from({ length: 10 }, (_, i) => makeItem({ key: 'k' + i, value: 'x'.repeat(160) }))
-    const kept = fitBudget(items, 300, 160, (s) => s)
-    expect(kept.length).toBeGreaterThanOrEqual(1)
-    expect(kept.length).toBeLessThan(10)
-    expect(kept[0].key).toBe('k0')
+    const fitted = fitBudget(items, 300, 160, (s) => s)
+    expect(fitted.kept.length).toBeGreaterThanOrEqual(1)
+    expect(fitted.kept.length).toBeLessThan(10)
+    expect(fitted.kept[0].key).toBe('k0')
+    expect(fitted.used).toBeGreaterThan(0)
   })
 
   it('bigramJaccard 语义相近得分更高', () => {
