@@ -119,7 +119,7 @@ describe('M6 导入限制', () => {
     const getTool = fake.toolDefs.get('memory_get')
     const g = await getTool.execute({ key: 'import-0.ref-long', includeFull: true })
     expect(g.found).toBe(true)
-    expect(g.full.length).toBeLessThanOrEqual(241)   // 240 + 结尾省略号
+    expect(g.full.length).toBeLessThanOrEqual(243)   // 240 + 省略号（输出面 NFKC 将 … 展开为 ...）
   })
 
   it('导入默认 scope 为工作区 scope 而非 global', async () => {
