@@ -15,6 +15,14 @@ export declare function validateKeyPrefix(key: string, scope: string): void;
 export declare const CREDENTIAL_RE: RegExp;
 /** 返回命中的凭据片段（未命中 null） */
 export declare function findCredentialMatch(body: string): string | null;
+/**
+ * C7：凭据掩码（工具出库面用）。记忆原文会随工具返回进入会话上下文并外发至
+ * 配置的 LLM provider——auth.* 与命中凭据正则的条目默认只回掩码，保留可识别
+ * 前缀（sk-/ghp_/AKIA/Bearer）以便用户知道"这里有一条什么凭据记忆"。
+ */
+export declare function maskCredential(text: string): string;
+/** C7：该条目是否属于"默认掩码、需显式确认才返回原文"的类别 */
+export declare function isCredentialItem(key: string, value: string): boolean;
 export interface UpsertInput {
     key: string;
     value: string;

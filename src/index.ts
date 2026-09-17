@@ -12,7 +12,7 @@
  */
 import { existsSync, promises as fs, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, sep } from 'node:path'
 import type { Context } from 'cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
@@ -98,6 +98,11 @@ export interface Config {
   valueMaxChars?: number
   /** full 完整正文总长上限（默认 8000）：超出截断，避免同一 key 反复更新导致无限膨胀 */
   fullMaxChars?: number
+  /**
+   * M12 记忆库条数上限（默认 2000）：新增条目会使总数超过该值时拒绝写入（更新已有条目不受限），
+   * 并提示跑 memory_dream 归档/清理；救援通道 /memory restore 不受此限。
+   */
+  maxItems?: number
   /** task.* 保鲜期（天，默认 30）：超期在召回评分中降权，避免过时任务状态被当成现状 */
   taskTtlDays?: number
   /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
@@ -133,6 +138,7 @@ export const Config = z.object({
   approveOnSet: z.boolean().default(false),
   valueMaxChars: z.number().default(240),
   fullMaxChars: z.number().default(8000),
+  maxItems: z.number().default(2000),
   taskTtlDays: z.number().default(30),
   autoExtract: z.boolean().default(true),
   autoExtractCooldownMs: z.number().default(120 * 1000),
@@ -191,6 +197,9 @@ export function apply(ctx: Context, config: Config): void {
   const valueMaxChars = Math.max(120, config.valueMaxChars || 240)
   // m9：full 总长上限——修复前同一 key 反复超长更新会把原文一再追加进 full，无限膨胀
   const fullMaxChars = Math.max(1000, config.fullMaxChars || 8000)
+  // M12 容量守卫（v0.1.23）：条数无上限时，召回扫描与「整库重写」I/O 都随库线性劣化。
+  // 默认 2000，可按需调小（小库/测试场景）；只挡「新增」——更新已有条目永远放行。
+  const maxItems = Math.max(1, Math.floor(Number(config.maxItems) || 2000))
 
   // ── 运行时开关（B1 修复，v0.1.23）───────────────────────────────────
   // 设置面板 applyPanel 只写 runtime；全部消费点只读 runtime。
@@ -1305,6 +1314,13 @@ export function apply(ctx: Context, config: Config): void {
         source,
         explicitSource: Boolean((input.source || '').trim()),
       }, { dedupe: dedupeOnSet, makeId })
+      // M12 容量守卫：只挡「新增」。items 是 readItems() 的副本，此处直接抛错即可——
+      // writeItems 尚未执行，本次 push 不会落盘（withConflictRetry 只对 StoreConflictError 重试，
+      // 业务错误一律立即上抛，因此不会出现「超限被重试后写进去」的窗口）。
+      if (result.created && items.length > maxItems) {
+        items.pop()
+        throw new Error(`memory_set: 记忆库已达上限（${items.length}/${maxItems} 条），本次新增被拒绝。请先跑 memory_dream（apply: true 可归档超 90 天条目）或 memory_forget / 合并旧条目腾出空间；更新已有条目不受上限限制。`)
+      }
       // 冲突警告在回调内重算但不就地 push（withConflictRetry 重试会重复累加）
       const clashWarning = result.clashKey !== undefined && result.clashSim !== undefined
         ? `与已有条目 ${scope}/${result.clashKey} 内容高度相似（${Math.round(result.clashSim * 100)}%）：请确认是否应更新该条（memory_set 同 key）而非新建`
@@ -1585,13 +1601,31 @@ export function apply(ctx: Context, config: Config): void {
     // 注意：中文后不能用 \b（'已完成' 的 '成' 不是 \w，边界不成立）
     /^(已完成|done|completed)(?![\w\u4e00-\u9fff])|\bstatus\s*[:=]\s*(done|completed)/i.test(value.trim())
 
-  // ── 记忆代谢（v0.1.9）：列出过期候选，由模型决定更新/归档/删除 ────────
+  // M12 归档摘要：value 压成一行（换行→空格）且 ≤80 字。value 只承担检索展示，
+  // 原文进 full 不丢信息——归档是「缩小检索面」，不是删除。
+  const ARCHIVE_SUMMARY_MAX = 80
+  // 上限按「取回时的形态」收敛：memory_get / 面板都会先过 sanitizeValue，其 NFKC 归一
+  // 会把 '…'(U+2026) 展成 '...'（1→3 字符）。若按 raw 长度卡 80，取回后实测是 82，
+  // 违反「value ≤80 字」的承诺——所以这里用清洗后的长度做判据。
+  function oneLineSummary(value: string): string {
+    const oneLine = value.replace(/\s+/g, ' ').trim()
+    let cut = Math.min(oneLine.length, ARCHIVE_SUMMARY_MAX)
+    while (cut > 0) {
+      const candidate = oneLine.length <= ARCHIVE_SUMMARY_MAX ? oneLine : oneLine.slice(0, cut) + '…'
+      if (sanitizeValue(candidate).length <= ARCHIVE_SUMMARY_MAX) return candidate
+      cut--
+    }
+    return oneLine.slice(0, ARCHIVE_SUMMARY_MAX)
+  }
+
+  // ── 记忆代谢（v0.1.9）：列出过期候选；M12 起 apply:true 可直接归档（不删条目）──
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_dream',
-    description: '记忆代谢维护：列出过期/低活跃候选条目（task.* 超 30 天未更新、任意条目超 90 天、标记完成超 14 天），给出处理建议，由你执行后续 memory_set/memory_forget。',
+    description: '记忆代谢维护：列出过期/低活跃候选条目（task.* 超 30 天未更新、任意条目超 90 天、标记完成超 14 天），给出处理建议。apply:true 时直接归档超 90 天条目（value 压缩为一行摘要、原文保留进 full），不删除任何条目。',
     parameters: {
       scope: { type: 'string', description: '限定作用域，默认全部' },
       maxItems: { type: 'number', description: '最多列出的候选数，默认 20' },
+      apply: { type: 'boolean', description: 'true 时归档超过 90 天的条目：value 压缩为一行摘要（≤80 字），原文完整保留进 full（memory_get includeFull 可取回）；默认 false 只列候选' },
     },
     output: {
       schema: {
@@ -1604,17 +1638,21 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => [{ type: 'text', text: value.summary }],
     },
-    async execute(args: { scope?: string; maxItems?: number }) {
+    async execute(args: { scope?: string; maxItems?: number; apply?: boolean }) {
       const scopeFilter = args.scope ? normalizeScope(args.scope, defaultScope) : ''
       const maxItems = Math.max(1, Math.min(50, Number(args.maxItems) || 20))
-      return withLock(async () => {
+      const apply = args.apply === true
+      // M12：apply 要写库，整段必须走 withConflictRetry（读→改→写是一个原子序列）
+      return withLock(() => withConflictRetry(async () => {
         const items = await readItems()
         const nowMs = Date.now()
         const DAY = 86_400_000
+        const ageDaysOf = (iso: string) => Math.floor((nowMs - Date.parse(iso)) / DAY)
+        const inScope = (item: MemoryItem) => (!scopeFilter || item.scope === scopeFilter) && !item.key.startsWith('auth.')
         const candidates = items
-          .filter((item) => (!scopeFilter || item.scope === scopeFilter) && !item.key.startsWith('auth.'))
+          .filter(inScope)
           .map((item) => {
-            const ageDays = Math.floor((nowMs - Date.parse(item.updatedAt)) / DAY)
+            const ageDays = ageDaysOf(item.updatedAt)
             let reason = ''
             let suggest = ''
             if (item.key.startsWith('task.') && ageDays > 30) { reason = 'task 状态超过 30 天未更新'; suggest = '确认是否已完成/过时：更新 value 或 memory_forget' }
@@ -1625,14 +1663,39 @@ export function apply(ctx: Context, config: Config): void {
           .filter((c) => c.reason)
           .sort((a, b) => b.ageDays - a.ageDays)
           .slice(0, maxItems)
-        const summary = candidates.length === 0
+        // M12 归档：只压 value（检索面），原文进 full（检索面缩小、信息不丢）。
+        // 刻意不动 updatedAt——「多久没更新」是事实，改掉会让陈旧条目伪装成新鲜记忆；
+        // 压缩后的 value 已是短摘要，再次 apply 会跳过（幂等）。
+        const archived: string[] = []
+        if (apply) {
+          const stamp = new Date(nowMs).toISOString()
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i]
+            if (!inScope(item) || ageDaysOf(item.updatedAt) <= 90) continue
+            const summary = oneLineSummary(item.value)
+            if (summary === item.value) continue
+            const body = `<!-- 归档 ${stamp}：value 已压缩为一行摘要，以下为原文 -->\n${item.value}`
+            const full = item.full ? `${body}\n\n${item.full}`.slice(0, fullMaxChars) : body.slice(0, fullMaxChars)
+            items[i] = { ...item, value: summary, full }
+            archived.push(`${item.scope}/${item.key}`)
+          }
+          if (archived.length > 0) await writeItems(items)
+        }
+        const archivedSet = new Set(archived)
+        const listed = apply ? candidates.filter((c) => !archivedSet.has(`${c.scope}/${c.key}`)) : candidates
+        const listText = listed.map((c) => `- [${c.scope}/${c.key}] ${c.ageDays} 天前更新，${c.reason} → ${c.suggest}`).join('\n')
+        const headText = listed.length === 0
           ? '记忆代谢：没有发现过期候选，记忆库很健康。'
-          : `记忆代谢：发现 ${candidates.length} 条过期候选（按陈旧度排序）：\n` + candidates.map((c) => `- [${c.scope}/${c.key}] ${c.ageDays} 天前更新，${c.reason} → ${c.suggest}`).join('\n')
+          : `记忆代谢：发现 ${listed.length} 条过期候选（按陈旧度排序）：\n` + listText
+        // 归档文案固定带「归档」二字：调用方据此确认 apply 真的生效
+        const summary = apply
+          ? `记忆代谢归档（apply=true）：已归档 ${archived.length} 条超过 90 天的条目——value 压缩为一行摘要（≤${ARCHIVE_SUMMARY_MAX} 字）、原文完整保留在 full（memory_get includeFull 可取回），未删除任何条目。\n` + headText
+          : headText
         return {
-          candidates: candidates.map((c) => `${c.scope}/${c.key}|${c.ageDays} 天|${c.reason}|${c.suggest}`),
+          candidates: listed.map((c) => `${c.scope}/${c.key}|${c.ageDays} 天|${c.reason}|${c.suggest}`),
           summary,
         }
-      })
+      }))
     },
   })), '@dsh-external/dsh-persistent-memory: memory_dream')
 
@@ -1809,11 +1872,42 @@ export function apply(ctx: Context, config: Config): void {
     return '<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH 记忆面板</title><style>' + css + '</style></head><body><h2>DSH 记忆面板</h2><p id="count"></p><input id="q" placeholder="搜索 key / 内容 / 标签…"><div id="list"></div><script>' + js + '</script></body></html>'
   }
 
+  // M12：/memory restore 的条目归一（导出文件的 items → MemoryItem）。
+  // 原则是「忠实恢复」：不跑写侧闸门（前缀白名单/凭据闸门约束的是新内容的来源，
+  // 恢复的是本库既往数据，卡住等于救援失败），只按 store.readItems 的坏行口径丢弃结构非法项。
+  function normalizeRestoredItems(raw: unknown[]): { items: MemoryItem[]; skipped: number } {
+    const out: MemoryItem[] = []
+    let skipped = 0
+    for (const entry of raw) {
+      const e = entry as Record<string, unknown> | null
+      if (!e || typeof e !== 'object' || Array.isArray(e) || typeof e.key !== 'string' || !e.key.trim() || typeof e.value !== 'string') {
+        skipped++
+        continue
+      }
+      const nowIso = new Date().toISOString()
+      const tags = Array.isArray(e.tags) ? e.tags.filter((t): t is string => typeof t === 'string') : []
+      const links = Array.isArray(e.links) ? e.links.filter((l): l is string => typeof l === 'string') : []
+      out.push({
+        id: typeof e.id === 'string' && e.id ? e.id : makeId(),
+        key: e.key.trim(),
+        value: e.value,
+        ...(typeof e.full === 'string' ? { full: e.full } : {}),
+        ...(links.length ? { links } : {}),
+        scope: normalizeScope(typeof e.scope === 'string' ? e.scope : '', defaultScope),
+        tags,
+        createdAt: typeof e.createdAt === 'string' && e.createdAt ? e.createdAt : nowIso,
+        updatedAt: typeof e.updatedAt === 'string' && e.updatedAt ? e.updatedAt : nowIso,
+        ...(typeof e.source === 'string' ? { source: e.source } : {}),
+      })
+    }
+    return { items: out, skipped }
+  }
+
   async function executeMemoryCommand(invocation: CommandInvocation): Promise<CommandResult> {
     const raw = invocation.rawInput.trim()
     const [sub, ...rest] = raw.split(/\s+/)
     const arg = rest.join(' ').trim()
-    const USAGE = 'Usage: /memory <status|recall <查询>|remember <key> <内容>|forget <key>|dream|import <文件>|panel>'
+    const USAGE = 'Usage: /memory <status|recall <查询>|remember <key> <内容>|forget <key>|dream|import <文件>|export <文件>|restore <文件>|panel>'
     switch (sub) {
       case 'status':
       case 'stats': {
@@ -1891,6 +1985,75 @@ export function apply(ctx: Context, config: Config): void {
           return { kind: 'success', text: r.summary }
         } catch (err) {
           return { kind: 'error', text: String(err instanceof Error ? err.message : err) }
+        }
+      }
+      case 'export': {
+        if (!arg) return { kind: 'error', text: 'Usage: /memory export <文件路径>' }
+        const outPath = isAbsolute(arg) ? arg : join(dataDir, arg)
+        try {
+          const items = await withLock(async () => readItems())
+          await fs.mkdir(dirname(outPath), { recursive: true })
+          await fs.writeFile(outPath, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), items }, null, 2), 'utf8')
+          const credCount = items.filter((item) => item.key.toLowerCase().startsWith('auth.')).length
+          return {
+            kind: 'success',
+            text: `已导出 ${items.length} 条记忆（含 full 原文）到：${outPath}`
+              + (credCount > 0 ? `\n⚠️ 其中 ${credCount} 条 auth.* 凭据为明文，请妥善保管该文件。` : ''),
+          }
+        } catch (err) {
+          return { kind: 'error', text: '导出失败：' + String(err instanceof Error ? err.message : err) }
+        }
+      }
+      case 'restore': {
+        if (!arg) return { kind: 'error', text: 'Usage: /memory restore <导出文件路径>' }
+        const srcPath = isAbsolute(arg) ? arg : join(dataDir, arg)
+        // 先校验来源文件：非法文件必须在备份/写库之前被挡住（不留无意义备份，更不留半截状态）
+        let parsed: { items?: unknown } | null = null
+        try {
+          parsed = JSON.parse(await fs.readFile(srcPath, 'utf8')) as { items?: unknown }
+        } catch (err) {
+          return { kind: 'error', text: `恢复失败：无法读取或解析 ${srcPath}（${String(err instanceof Error ? err.message : err)}），记忆库未改动。` }
+        }
+        if (!parsed || !Array.isArray(parsed.items)) {
+          return { kind: 'error', text: `恢复失败：${srcPath} 不是有效的导出文件（缺少 items 数组），记忆库未改动。` }
+        }
+        const { items: incoming, skipped } = normalizeRestoredItems(parsed.items)
+        // 再备份：恢复是覆盖式写入，必须先留一条回滚通道（B2 崩溃/误删场景唯一的自救口）
+        const backupPath = join(dataDir, `memory.jsonl.pre-restore-${new Date().toISOString().replace(/[:.]/g, '-')}`)
+        try {
+          await fs.mkdir(dataDir, { recursive: true })
+          let rawCurrent = ''
+          try {
+            rawCurrent = await fs.readFile(dataFile, 'utf8')
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+          }
+          await fs.writeFile(backupPath, rawCurrent, 'utf8')
+        } catch (err) {
+          return { kind: 'error', text: `恢复中止：备份当前记忆库失败（${String(err instanceof Error ? err.message : err)}），记忆库未改动。` }
+        }
+        try {
+          const outcome = await withLock(() => withConflictRetry(async () => {
+            const items = await readItems()
+            let overwritten = 0
+            let added = 0
+            for (const item of incoming) {
+              const idx = items.findIndex((entry) => entry.scope === item.scope && entry.key === item.key)
+              if (idx >= 0) { items[idx] = item; overwritten++ } else { items.push(item); added++ }
+            }
+            // 空 items 的导出文件不做任何删除：恢复只覆盖/新增，绝不清库
+            if (incoming.length > 0) await writeItems(items)
+            return { total: items.length, overwritten, added }
+          }))
+          return {
+            kind: 'success',
+            text: `已从 ${srcPath} 恢复：新增 ${outcome.added} 条、覆盖 ${outcome.overwritten} 条，当前共 ${outcome.total} 条`
+              + (skipped > 0 ? `（跳过结构非法的 ${skipped} 条）` : '')
+              + `\n原记忆库已备份到：${backupPath}`
+              + `\n如需回滚：把该备份文件复制回 ${dataFile} 即可（恢复只做覆盖/新增，不会删除库中其它条目）。`,
+          }
+        } catch (err) {
+          return { kind: 'error', text: `恢复失败：${String(err instanceof Error ? err.message : err)}。原记忆库已备份到 ${backupPath}，复制回去即可回滚。` }
         }
       }
       case 'panel': {
