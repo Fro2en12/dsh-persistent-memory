@@ -18,6 +18,8 @@ export interface StoreFs {
     open(path: string, flags: string): Promise<StoreFileHandle>;
     rename(from: string, to: string): Promise<void>;
     copyFile(from: string, to: string): Promise<void>;
+    /** 清理 tmp 残留与释放写锁（必填：缺失会导致锁泄漏） */
+    unlink(path: string): Promise<void>;
 }
 export interface StoreOptions {
     fs: StoreFs;
@@ -31,6 +33,16 @@ export interface StoreOptions {
     /** 启动告警等非致命诊断 */
     onWarn?: (message: string) => void;
 }
+/** 乐观并发冲突：磁盘版本已不是本实例读到的那一版（B3 跨进程保护） */
+export declare class StoreConflictError extends Error {
+    readonly code = "MEMORY_STORE_CONFLICT";
+    constructor(message: string);
+}
+/**
+ * B3：冲突重试助手。fn 内必须是「读 → 改 → 写」的完整序列——
+ * writeItems 失败会失效缓存，重试时 readItems 会重新读盘，绝不基于旧快照重写。
+ */
+export declare function withConflictRetry<T>(fn: () => Promise<T>, attempts?: number): Promise<T>;
 export interface MemoryStore {
     readItems(): Promise<MemoryItem[]>;
     writeItems(items: MemoryItem[]): Promise<void>;

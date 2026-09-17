@@ -62,6 +62,11 @@ function makeStubFs(initial: Record<string, string> = {}) {
       files.set(to, content)
       touch(to)
     },
+    unlink: async (p) => {
+      if (!files.has(p)) throw err('ENOENT')
+      files.delete(p)
+      mtimes.delete(p)
+    },
   }
   return {
     fs,

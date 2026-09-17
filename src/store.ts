@@ -19,6 +19,8 @@ export interface StoreFs {
   open(path: string, flags: string): Promise<StoreFileHandle>
   rename(from: string, to: string): Promise<void>
   copyFile(from: string, to: string): Promise<void>
+  /** 清理 tmp 残留与释放写锁（必填：缺失会导致锁泄漏） */
+  unlink(path: string): Promise<void>
 }
 
 export interface StoreOptions {
@@ -32,6 +34,32 @@ export interface StoreOptions {
   now?: () => string
   /** 启动告警等非致命诊断 */
   onWarn?: (message: string) => void
+}
+
+/** 乐观并发冲突：磁盘版本已不是本实例读到的那一版（B3 跨进程保护） */
+export class StoreConflictError extends Error {
+  readonly code = 'MEMORY_STORE_CONFLICT'
+  constructor(message: string) {
+    super(message)
+    this.name = 'StoreConflictError'
+  }
+}
+
+/**
+ * B3：冲突重试助手。fn 内必须是「读 → 改 → 写」的完整序列——
+ * writeItems 失败会失效缓存，重试时 readItems 会重新读盘，绝不基于旧快照重写。
+ */
+export async function withConflictRetry<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (!(err instanceof StoreConflictError)) throw err
+      lastErr = err
+    }
+  }
+  throw lastErr ?? new StoreConflictError('memory.jsonl 并发写入冲突，重试次数已用尽')
 }
 
 export interface MemoryStore {
@@ -52,7 +80,57 @@ export interface MemoryStore {
  * 成功后才刷新缓存。
  */
 export function createStore(opts: StoreOptions): MemoryStore {
+  // B3：跨进程写锁（fs.open 'wx' 独占创建 + 陈旧锁超时清除）。
+  // 单靠 size/mtime 乐观校验有 TOCTOU 窗口（校验与 rename 之间会让出事件循环），
+  // 两者叠加：锁负责互斥，版本校验负责挡住绕过锁的外部写入（手工编辑/其它工具）。
+  const LOCK_STALE_MS = 10_000
+  const LOCK_WAIT_MS = 10_000
+  const lockFile = opts.dataFile + '.lock'
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+  async function acquireWriteLock(): Promise<() => Promise<void>> {
+    const deadline = Date.now() + LOCK_WAIT_MS
+    for (;;) {
+      try {
+        const fh = await opts.fs.open(lockFile, 'wx')
+        try {
+          await fh.writeFile(String(process.pid), 'utf8')
+        } finally {
+          await fh.close()
+        }
+        return releaseWriteLock
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      }
+      // 陈旧锁（持有者崩溃）：超过 LOCK_STALE_MS 未更新则清除
+      try {
+        const st = await opts.fs.stat(lockFile)
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          try { await opts.fs.unlink(lockFile) } catch { /* 竞态下别人已清 */ }
+          continue
+        }
+      } catch { /* 锁已消失，立即重试 */ continue }
+      if (Date.now() > deadline) {
+        throw new StoreConflictError('无法获取 memory.jsonl 写锁（等待超时），本次写入放弃以避免覆盖')
+      }
+      await sleep(5 + Math.floor(Math.random() * 15))
+    }
+  }
+
+  async function releaseWriteLock(): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      try {
+        await opts.fs.unlink(lockFile)
+        return
+      } catch {
+        await sleep(10)
+      }
+    }
+  }
+
   let itemsCache: { mtimeMs: number; size: number; items: MemoryItem[] } | null = null
+  // B3：本实例读到的磁盘版本（null = 没读过；stamp=null = 读到的是不存在的文件）
+  let readState: { stamp: StoreFsStat | null } | null = null
   let warnedZeroBak = false
   let dropped = 0
   const bakFile = opts.dataFile + '.bak'
@@ -64,7 +142,11 @@ export function createStore(opts: StoreOptions): MemoryStore {
     try {
       st = await opts.fs.stat(opts.dataFile)
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // 读到「文件不存在」也是有效版本：此后若文件被别的进程创建，本实例写入必须报冲突
+        readState = { stamp: null }
+        return []
+      }
       throw err
     }
     if (itemsCache && itemsCache.mtimeMs === st.mtimeMs && itemsCache.size === st.size) {
@@ -85,7 +167,10 @@ export function createStore(opts: StoreOptions): MemoryStore {
     try {
       text = await opts.fs.readFile(opts.dataFile, 'utf8')
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        readState = { stamp: null }
+        return []
+      }
       throw err
     }
     const items: MemoryItem[] = []
@@ -121,15 +206,42 @@ export function createStore(opts: StoreOptions): MemoryStore {
       }
     }
     itemsCache = { mtimeMs: st.mtimeMs, size: st.size, items }
+    readState = { stamp: { mtimeMs: st.mtimeMs, size: st.size } }
     return items.slice()
   }
 
   function invalidateCache(): void {
     itemsCache = null
+    readState = null
   }
 
   async function writeItems(items: MemoryItem[]): Promise<void> {
+    const release = await acquireWriteLock()
     try {
+      await writeItemsLocked(items)
+    } finally {
+      await release()
+    }
+  }
+
+  async function writeItemsLocked(items: MemoryItem[]): Promise<void> {
+    try {
+      // B3 乐观并发：磁盘仍是本实例读到的那一版才允许覆盖，否则交给 withConflictRetry 重试
+      if (readState) {
+        let cur: StoreFsStat | null = null
+        try {
+          cur = await opts.fs.stat(opts.dataFile)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+        }
+        const expected = readState.stamp
+        const sameVersion = expected === null
+          ? cur === null
+          : cur !== null && cur.mtimeMs === expected.mtimeMs && cur.size === expected.size
+        if (!sameVersion) {
+          throw new StoreConflictError('memory.jsonl 已被其他进程修改（size/mtime 不一致），本次写入放弃以避免覆盖')
+        }
+      }
       await opts.fs.mkdir(opts.dataDir, { recursive: true })
       const body = items.map((item) => JSON.stringify(item)).join('\n') + '\n'
       // B2：写前把当前主文件复制为 .bak（保留 1 份上一版完整快照）
@@ -139,15 +251,30 @@ export function createStore(opts: StoreOptions): MemoryStore {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
       }
       // B2：tmp + write + fsync + close + rename（同盘 rename 原子替换主文件）
-      const tmp = opts.dataFile + '.tmp-' + process.pid + '-' + Date.now().toString(36)
-      const fh = await opts.fs.open(tmp, 'w')
+      // 随机后缀：同一进程内并发写（以及 pid 复用）不能让两个 tmp 同名，否则 rename 互相抢文件
+      const tmp = opts.dataFile + '.tmp-' + process.pid + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
       try {
-        await fh.writeFile(body, 'utf8')
-        await fh.sync()
-      } finally {
-        await fh.close()
+        const fh = await opts.fs.open(tmp, 'w')
+        try {
+          await fh.writeFile(body, 'utf8')
+          await fh.sync()
+        } finally {
+          await fh.close()
+        }
+        try {
+          await opts.fs.rename(tmp, opts.dataFile)
+        } catch (err) {
+          // Windows 并发替换目标文件会报 EPERM/EBUSY/EACCES —— 语义上就是「别人正在改」，按冲突重试
+          const code = (err as NodeJS.ErrnoException).code
+          if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+            throw new StoreConflictError('memory.jsonl 正被其他进程替换（' + code + '），本次写入放弃以避免覆盖')
+          }
+          throw err
+        }
+      } catch (err) {
+        try { await opts.fs.unlink(tmp) } catch { /* 清理失败不影响主流程 */ }
+        throw err
       }
-      await opts.fs.rename(tmp, opts.dataFile)
     } finally {
       // C1：无论成败必失效——失败后旧缓存与磁盘状态可能不一致，绝不复用
       invalidateCache()
@@ -155,6 +282,7 @@ export function createStore(opts: StoreOptions): MemoryStore {
     // C1：成功后才刷新缓存（按重命名后的新文件 stat），下一次读取直接命中
     const st = await opts.fs.stat(opts.dataFile)
     itemsCache = { mtimeMs: st.mtimeMs, size: st.size, items: items.slice() }
+    readState = { stamp: { mtimeMs: st.mtimeMs, size: st.size } }
   }
 
   return { readItems, writeItems, invalidateCache, getDropped: () => dropped }

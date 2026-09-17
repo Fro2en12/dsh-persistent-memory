@@ -34,6 +34,7 @@ function makeStubFs(initial: Record<string, string> = {}) {
     open: async (): Promise<StoreFileHandle> => ({ writeFile: async () => {}, sync: async () => {}, close: async () => {} }),
     rename: async () => {},
     copyFile: async () => {},
+    unlink: async () => {},
   }
   return fs
 }
