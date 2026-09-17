@@ -321,15 +321,16 @@ describe('M9 truncate 边界', () => {
     expect(truncate('hello world. more text follows here', 14)).toBe('hello world.…')
   })
 
-  it('边界位置 ≤ max*0.5 或不在切片内 → 走硬截断（长度 = max + 省略号）', () => {
+  // T14（第五轮）：省略号计入 maxChars —— 硬截断分支返回 head(max-1 字) + '…'，总长恰为 max
+  it('边界位置 ≤ max*0.5 或不在切片内 → 走硬截断（长度 = max，省略号计入额度）', () => {
     const early = truncate('a. ' + 'b'.repeat(16), 12)
-    expect(early).toBe('a. ' + 'b'.repeat(9) + '…')
-    expect(early.length).toBe(13)
-    // 若走边界分支结果会是 'a. …'（4 字）；硬截断保留满 max 个字符
+    expect(early).toBe('a. ' + 'b'.repeat(8) + '…')
+    expect(early.length).toBe(12)
+    // 若走边界分支结果会是 'a. …'（4 字）；硬截断保留 max-1 个字符
     expect(early.slice(0, 3)).toBe('a. ')
-    expect(early.slice(3)).toBe('b'.repeat(9) + '…')
-    expect(truncate('abcd。efghijklmnop', 8)).toBe('abcd。efg…')
-    expect(truncate('abcdefghij. klmnop', 10)).toBe('abcdefghij…')
+    expect(early.slice(3)).toBe('b'.repeat(8) + '…')
+    expect(truncate('abcd。efghijklmnop', 8)).toBe('abcd。ef…')
+    expect(truncate('abcdefghij. klmnop', 10)).toBe('abcdefghi…')
   })
 })
 

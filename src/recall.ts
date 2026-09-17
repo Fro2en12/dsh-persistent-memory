@@ -298,15 +298,18 @@ export function fitBudget(
   return { kept, used }
 }
 
-// 在句子边界（。；！？/换行/空格）截断，避免"…dsh-file-…"这种半截文字
+// 在句子边界（。；！？/换行/空格）截断，避免"…dsh-file-…"这种半截文字。
+// T14：省略号计入 maxChars —— 返回值长度恒 ≤ max（旧实现硬截断分支返回 max+1，
+// 让「value ≤ valueMaxChars 字」的数据口径不成立）。句边界分支同样从 max-1 的头部里取。
 export function truncate(text: string, max: number): string {
   if (text.length <= max) return text
-  const slice = text.slice(0, max)
+  if (max <= 0) return ''
+  const head = text.slice(0, max - 1)
   const boundary = Math.max(
-    slice.lastIndexOf('。'), slice.lastIndexOf('；'), slice.lastIndexOf('！'),
-    slice.lastIndexOf('？'), slice.lastIndexOf('\n'), slice.lastIndexOf('. '),
+    head.lastIndexOf('。'), head.lastIndexOf('；'), head.lastIndexOf('！'),
+    head.lastIndexOf('？'), head.lastIndexOf('\n'), head.lastIndexOf('. '),
   )
-  return boundary > max * 0.5 ? `${slice.slice(0, boundary + 1)}…` : `${slice}…`
+  return boundary > max * 0.5 ? `${head.slice(0, boundary + 1)}…` : `${head}…`
 }
 
 // ── 记忆新鲜度（借鉴 Claude Code memoryAge.ts）────────────────────────

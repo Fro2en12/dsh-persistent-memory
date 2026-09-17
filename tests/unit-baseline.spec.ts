@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { normalizeScope, validateKeyPrefix, findCredentialMatch, upsertMemory } from '../src/write-gate'
 import { sanitizeValue } from '../src/sanitize'
 import { slugKey, parseImportEntries } from '../src/import'
-import { scoreItem, queryTokens, truncate, ageLabel, fitBudget, bigramJaccard, pickRecallItems } from '../src/recall'
+import {
+  scoreItem, queryTokens, truncate, ageLabel, fitBudget, bigramJaccard, pickRecallItems,
+  rrfRanking, semanticOverlap, stripNoise,
+} from '../src/recall'
 import type { MemoryItem } from '../src/types'
 
 // M9 基线：提取后的纯函数与提取前行为逐字节等价（此文件断言的是 M9 时刻的现行行为，
@@ -126,9 +130,49 @@ describe('M9 提取基线：recall', () => {
     expect(scoreItem(item, 'x', true, env)).toBe(0)
   })
 
-  it('truncate 句边界截断', () => {
+  it('truncate 句边界截断（T14：省略号计入 maxChars）', () => {
     expect(truncate('短', 10)).toBe('短')
-    expect(truncate('很长很长的句子没有边界', 3)).toBe('很长很…')
+    expect(truncate('很长很长的句子没有边界', 3)).toBe('很长…')
+  })
+
+  it('T14 回归：硬截断与句边界两个分支都不再产出 max+1', () => {
+    // 硬截断分支（旧实现 'abcdefghij' + '…' = 11 字）
+    expect(truncate('abcdefghijk', 10)).toBe('abcdefghi…')
+    expect(truncate('abcdefghijk', 10).length).toBe(10)
+    // 句边界分支：切片内含 '。'（旧实现 'abc。…' = 5 字）
+    expect(truncate('abc。defghijkl', 4)).toBe('abc…')
+    // '. ' 边界分支：切片内含 '.'（旧实现 'abcd.' + '…' = 6 字）
+    expect(truncate('abcd. efghijklmn', 5)).toBe('abcd…')
+    // 边界分支真的命中时同样 ≤ max
+    expect(truncate('ab。cd。efghijklmn', 7)).toBe('ab。cd。…')
+  })
+
+  it('T14 不变式：truncate(text, max).length ≤ max（含 max=0/1 边界）', () => {
+    const samples = [
+      '很长很长的句子没有边界',
+      'abcd。efghijklmnop',
+      'abc。defghijkl',
+      'abcdefghijk',
+      'hello world. more text follows here',
+      '第一行内容\n第二行内容还在继续',
+      'ab。cdef',
+      '注意安全！后面还有很多内容',
+      '这样可以吗？后面还有很多内容',
+      '前缀足够长的；后续内容也要足够长',
+      'x'.repeat(300),
+      '很长内容'.repeat(80),
+      '',
+    ]
+    const caps = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 80, 120, 240]
+    for (const s of samples) {
+      for (const max of caps) {
+        const out = truncate(s, max)
+        expect(out.length, 'truncate 超长 @max=' + max + ' len=' + out.length + ' text=' + JSON.stringify(s.slice(0, 12))).toBeLessThanOrEqual(max)
+        if (s.length > max) expect(out.endsWith('…'), '截断后应以 … 结尾 @max=' + max).toBe(true)
+      }
+    }
+    // 额度为 0 时不得残留内容（旧实现固定返回 '…'）
+    expect(truncate('abc', 0)).toBe('')
   })
 
   it('ageLabel 今天/昨天/N 天前', () => {
@@ -163,5 +207,84 @@ describe('M9 提取基线：recall', () => {
       rrfFirstTurnOnly: true,
     })
     expect(picked.map((i) => i.key)).toEqual(['pwsh'])
+  })
+})
+
+// ── T3-a：m3 stripNoise 预编译的【结构性】可证伪断言 ──────────────────────────
+// 语义等价断言（tests/minor-batch.spec.ts）在预编译前后都绿，无法证明「预编译生效」。
+// 这里直接读 src/recall.ts 源码文本断言结构：模块级正则存在 + stripNoise 函数体不再逐词循环。
+// 取舍：结构性断言与实现形态耦合（改动实现形式会误报），但它是唯一稳定（不 flaky）且可证伪的证据；
+// 性能断言（110 词 × 10000 次耗时上限）在 CI 上抖动大，不作为门槛。
+describe('T3-a m3：stripNoise 走模块级预编译正则', () => {
+  const src = readFileSync(new URL('../src/recall.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
+
+  it('模块级 const NOISE_RE = new RegExp(NOISE_WORDS…)，且带 g 标志', () => {
+    expect(src).toMatch(/^const NOISE_RE = new RegExp\(NOISE_WORDS\.map\(/m)
+    expect(src).toMatch(/^const NOISE_RE = new RegExp\([\s\S]*?'g'\)/m)
+  })
+
+  it('stripNoise 函数体不再遍历 NOISE_WORDS（改回 for/split-join 循环即红）', () => {
+    const m = src.match(/export function stripNoise\(token: string\): string \{([\s\S]*?)\n\}/)
+    expect(m, '未在 src/recall.ts 中找到 stripNoise 函数体').not.toBeNull()
+    const body = (m as RegExpMatchArray)[1]
+    expect(body).toContain('NOISE_RE')
+    expect(body).not.toContain('NOISE_WORDS')
+    expect(body).not.toMatch(/\bfor\s*\(/)
+    expect(body).not.toMatch(/\.split\(|\.join\(/)
+  })
+
+  it('预编译正则重复调用稳定（global 正则 lastIndex 不残留，旧循环实现无此风险）', () => {
+    for (const input of ['看看这个', '嗯嗯嗯', 'okay好的', 'pwsh路径', '顺便弄一下这个']) {
+      const first = stripNoise(input)
+      expect(stripNoise(input)).toBe(first)
+      expect(stripNoise(input)).toBe(first)
+    }
+    expect(stripNoise('看看这个')).toBe('')
+    expect(stripNoise('顺便弄一下这个')).toBe('')
+  })
+})
+
+// ── T3-b：m5 rrfRanking 的 isFirstTurn 透传 ───────────────────────────────────
+// 旧用例（tests/minor-batch.spec.ts）两个方向都只断言 length === 1：单条目时 RRF 分值两侧恒等，
+// isFirstTurn 是否真的传进 rrfRanking 无法被观测。这里构造排名会翻转的输入。
+describe('T3-b m5：pickRecallItems 把 isFirstTurn 透传给 rrfRanking', () => {
+  const RRF_ENV = {
+    synonymExpansion: true,
+    taskTtlDays: 30,
+    workspaceScopes: ['current-ws'],
+    autoRecallScope: '',
+    minScore: 6,
+    relativeFloor: 0.5,
+    rrfRecall: true,
+    rrfFirstTurnOnly: false,
+  }
+
+  it('无关 scope + 语义重叠恰好 1：首轮不补位，非首轮补位（minOverlap 2 vs 1）', () => {
+    const item = makeItem({ id: 'x1', key: 'rule.x', value: 'alpha only', scope: 'other-proj' })
+    expect(semanticOverlap('alpha beta', item.key + ' ' + item.value)).toBe(1)
+    expect(scoreItem(item, 'alpha beta', true, RRF_ENV)).toBe(0)    // 首轮：非当前工作区 scope 直接 0
+    expect(scoreItem(item, 'alpha beta', false, RRF_ENV)).toBe(-2)  // 非首轮：-4 降权 + value 命中 2
+    expect(pickRecallItems([item], 'alpha beta', 2, false, true, false, RRF_ENV)).toEqual([])
+    expect(pickRecallItems([item], 'alpha beta', 2, false, false, false, RRF_ENV).map((i) => i.id)).toEqual(['x1'])
+  })
+
+  it('首轮补位的 RRF 排名走首轮评分：与 rrfRanking(…, false) 排名不同，且补位 slice 结果不同', () => {
+    // 三条 key/value 完全相同、只有 tags 不同：tags 不进 bigram 文本，
+    // 于是「首轮全部 0 分（无关 scope 早退）→ 并列按输入序」与「非首轮 0/2/4 分」的排名会翻转。
+    const t = '2026-09-17T00:00:00.000Z'
+    const items = [
+      makeItem({ id: 'a', key: 'rule.same', value: 'alpha beta', tags: [], updatedAt: t }),
+      makeItem({ id: 'b', key: 'rule.same', value: 'alpha beta', tags: ['alpha'], updatedAt: t }),
+      makeItem({ id: 'c', key: 'rule.same', value: 'alpha beta', tags: ['alpha', 'beta'], updatedAt: t }),
+    ].map((i) => ({ ...i, scope: 'other-proj' }))
+    expect(items.map((i) => scoreItem(i, 'alpha beta', true, RRF_ENV))).toEqual([0, 0, 0])
+    expect(items.map((i) => scoreItem(i, 'alpha beta', false, RRF_ENV))).toEqual([0, 2, 4])
+    // rrfRanking 自身必须区分第 4 个参数
+    expect(rrfRanking(items, 'alpha beta', RRF_ENV, true).map((e) => e.item.id)).toEqual(['a', 'b', 'c'])
+    expect(rrfRanking(items, 'alpha beta', RRF_ENV, false).map((e) => e.item.id)).toEqual(['a', 'c', 'b'])
+    // pickRecallItems 首轮补位必须把 isFirstTurn=true 透传下去：
+    // 缺陷态（rrfRanking(scoped, query, env) 恒用 false）会返回 ['a','c']，与下面断言不符。
+    expect(pickRecallItems(items, 'alpha beta', 2, false, true, false, RRF_ENV).map((i) => i.id)).toEqual(['a', 'b'])
+    expect(pickRecallItems(items, 'alpha beta', 2, false, false, false, RRF_ENV).map((i) => i.id)).toEqual(['a', 'c'])
   })
 })
