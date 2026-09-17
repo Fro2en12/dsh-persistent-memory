@@ -21,6 +21,12 @@ import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands
 export const name = '@dsh-external/dsh-persistent-memory'
 export const inject = ['tools', 'commands', 'settings']
 
+// ── 分类白名单：守则文本 / 错误消息同源，防止提示词与实现漂移 ──
+/** key 前缀白名单（memory_set 硬校验的唯一真相） */
+const KEY_PREFIX_WHITELIST = ['user', 'rule', 'task', 'ref', 'env', 'project', 'tool', 'auth', 'lesson', 'plugin']
+/** 前缀清单展示串：守则文本与错误消息共用 */
+const KEY_PREFIX_LIST = KEY_PREFIX_WHITELIST.join('/')
+
 export interface Config {
   /** 记忆库目录；缺省为 $DSH_HOME/dsh-persistent-memory */
   dataDir?: string
@@ -70,6 +76,10 @@ export interface Config {
   valueMaxChars?: number
   /** task.* 保鲜期（天，默认 30）：超期在召回评分中降权，避免过时任务状态被当成现状 */
   taskTtlDays?: number
+  /** 轮末自动提取（默认 true）：每轮结束后异步回顾对话、沉淀高置信记忆，不依赖主模型当轮意愿 */
+  autoExtract?: boolean
+  /** 自动提取冷却毫秒数（默认 120 秒）：同一会话该窗口内不重复提取 */
+  autoExtractCooldownMs?: number
 }
 
 export const Config = z.object({
@@ -85,7 +95,7 @@ export const Config = z.object({
   autoRecallScope: z.string().default(''),
   autoRecallFallback: z.boolean().default(false),
   autoCapture: z.boolean().default(true),
-  autoCaptureDetail: z.string().default('brief'),
+  autoCaptureDetail: z.string().default('full'),
   autoRecallOnce: z.boolean().default(true),
   autoRecallCooldownMs: z.number().default(10 * 60 * 1000),
   synonymExpansion: z.boolean().default(true),
@@ -97,6 +107,8 @@ export const Config = z.object({
   approveOnSet: z.boolean().default(false),
   valueMaxChars: z.number().default(240),
   taskTtlDays: z.number().default(30),
+  autoExtract: z.boolean().default(true),
+  autoExtractCooldownMs: z.number().default(120 * 1000),
 })
 
 interface MemoryItem {
@@ -139,7 +151,10 @@ export function apply(ctx: Context, config: Config): void {
   const autoCapture = config.autoCapture !== false
   // 守则详略（v0.1.16）：默认 brief——完整守则约 1300 字且每会话常驻上下文，
   // 细则在 memory_set 校验报错时按需返回，不必每会话全量注入。
-  const autoCaptureDetail: 'brief' | 'full' = config.autoCaptureDetail === 'full' ? 'full' : 'brief'
+  // 默认完整版：只有显式配置 'brief' 才用精简版（不依赖 schema 默认值填充，裸 config 也一致）
+  const autoCaptureDetail: 'brief' | 'full' = config.autoCaptureDetail === 'brief' ? 'brief' : 'full'
+  const autoExtract = config.autoExtract !== false
+  const autoExtractCooldownMs = Math.max(30_000, config.autoExtractCooldownMs ?? 120 * 1000)
   const autoRecallOnce = config.autoRecallOnce !== false
   const autoRecallCooldownMs = Math.max(0, config.autoRecallCooldownMs ?? 10 * 60 * 1000)
   const rrfRecall = config.rrfRecall !== false
@@ -584,7 +599,22 @@ export function apply(ctx: Context, config: Config): void {
     return items.filter((item) => !item.key.toLowerCase().startsWith('auth.'))
   }
 
-  function pickLessonItems(items: MemoryItem[], isRegret: boolean, isRule: boolean, limit: number): MemoryItem[] {
+  // 教训通道的轻量词法命中：与 scoreItem 同源的噪声/弱词规则，但去掉工作区加分与
+  // 同义词扩展——只回答「这条记忆里是否真的出现了 query 的词」。
+  function lexicalHit(item: MemoryItem, query: string): boolean {
+    const key = item.key.toLowerCase()
+    const value = item.value.toLowerCase()
+    const tags = item.tags.map((tag) => tag.toLowerCase())
+    return queryTokens(query).some((token) => {
+      const stripped = stripNoise(token)
+      if (stripped.length < 2 && token.length < 8) return false
+      const isWeak = WEAK_WORDS.some((w) => token.includes(w))
+      if (key.includes(token)) return true
+      if (value.includes(token) && !isWeak) return true
+      return tags.some((tag) => tag.includes(token) || token.includes(tag))
+    })
+  }
+  function pickLessonItems(items: MemoryItem[], query: string, isRegret: boolean, isRule: boolean, limit: number): MemoryItem[] {
     const candidates = items.filter((item) => isLessonLike(item))
     if (candidates.length === 0) return []
     const scored = candidates.map((item) => {
@@ -593,10 +623,16 @@ export function apply(ctx: Context, config: Config): void {
       if (isRule && (blob.includes('路径') || blob.includes('path') || blob.includes('盘')
         || blob.includes('powershell') || blob.includes('pwsh') || blob.includes('终端') || blob.includes('命令'))) bonus += 10
       if (isRegret) bonus += 6
-      return { item, bonus }
+      // 相关性门槛：悔恨/场景信号只决定「要不要看教训」，不决定「看哪一条」。
+      // 只有真的与当前 query 沾边（共享中文二元组/英文词元，或词法命中）才准入——
+      // 否则库里 lesson 类条目少时会把无关规则一并塞进来，还顶掉本该出现的索引兜底。
+      const overlap = semanticOverlap(query, `${item.key} ${item.value}`)
+      const lexHit = lexicalHit(item, query)
+      return { item, bonus, relevance: overlap * 2 + (lexHit ? 3 : 0), hit: overlap >= 1 || lexHit }
     })
-    scored.sort((a, b) => (b.bonus - a.bonus) || b.item.updatedAt.localeCompare(a.item.updatedAt))
-    return scored.slice(0, limit).map((entry) => entry.item)
+    const relevant = scored.filter((entry) => entry.hit)
+    relevant.sort((a, b) => (b.bonus + b.relevance - (a.bonus + a.relevance)) || b.item.updatedAt.localeCompare(a.item.updatedAt))
+    return relevant.slice(0, limit).map((entry) => entry.item)
   }
 
   function pickRecallItems(
@@ -817,10 +853,11 @@ export function apply(ctx: Context, config: Config): void {
   // ── 记忆索引（对标 Claude Code MEMORY.md，动态生成不落盘）──────────────
   // 触发：首轮 && 无信号 && !hasImage && 常规召回 0 命中 && 教训通道未注入。
   // 替代画像兜底（v0.1.7 起 user.* 在 global 组有固定 2 席配额，画像真实呈现）。
-  function buildIndexBlock(rawItems: MemoryItem[]): string {
+  function buildIndexBlock(rawItems: MemoryItem[], excludeKeys?: Set<string>): string {
     // v0.1.20：只列 key 不列摘要（实测 424 → 约 160 字），并排除 auth.*——
     // 目录里出现 [auth.platforms] 这类 key 本身就是不该随新会话扩散的线索。
-    const items = excludeAuth(rawItems)
+    // 教训通道已给过内容的条目从目录里去掉，避免同一会话里重复出现。
+    const items = excludeAuth(rawItems).filter((item) => !excludeKeys?.has(`${item.scope}/${item.key}`))
     const scopes = new Map<string, MemoryItem[]>()
     for (const item of items) {
       const group = item.scope === 'global' ? 'global'
@@ -847,6 +884,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       if (picks.length) lines.push(`- ${scope}: ${picks.map((item) => item.key).join('、')}`)
     }
+    if (lines.length === 0) return ''
     lines.push('取内容：memory_search <关键词>')
     return `【记忆索引】以下记忆可查，本会话未自动召回：\n${lines.join('\n')}`
   }
@@ -871,55 +909,63 @@ export function apply(ctx: Context, config: Config): void {
   const AUTO_CAPTURE_TEXT = [
     '# 记忆使用守则（dsh-persistent-memory）',
     '',
-    '你有跨会话的长期记忆库。它替你省下重复解释的成本，代价是必须守纪律：乱记比不记更糟——错误记忆会跨会话传播，而且看起来和正确记忆一样可信。',
-    '自动召回会把相关记忆和记忆索引注入上下文，你不需要为此做任何事；**不要**因为收到了注入就复述、确认或立刻写入——那只是一个注意力信号，不是待办。',
+    '你有跨会话的长期记忆库：把用户偏好、踩过的坑与定过的结论攒下来，让未来的会话少走弯路——代价是必须守纪律：乱记比不记更糟，错误记忆会跨会话传播，而且看起来和正确记忆一样可信。',
+    '自动召回会把相关记忆与记忆索引注入上下文，你不需要为此做任何事；不要因为收到注入就复述、确认或立刻写入——那只是注意力信号，不是待办。',
     '',
     '## 什么时候查',
-    '- 用户提到你不可能记得的事（「上次」「之前那个」「我说过的」）、或抱怨同一件事又做错（「又错了」「还是不行」）→ `memory_search`（关键词 + tags/scope 过滤），命中后 `memory_get` 读细节。',
-    '- 记忆库里没有、但以前会话说过的事 → `memory_recall`（全文检索历史会话）。',
-    '- 要重走一条曾经失败过的路径 → 检索时带上 `lesson` 类关键词。',
-    '不要每轮都查。没有明确信号就不查；查不到不是失败，硬用不相关的记忆才是。',
+    '- 用户提到你不可能记得的事（「上次」「之前那个」「我说过的」）→ `memory_search`（关键词 + tags/scope），命中后 `memory_get` 读细节。',
+    '- 用户抱怨同一件事又做错（「又错了」「还是不行」）→ 检索时带 `lesson`/`rule` 关键词，先看上次是怎么栽的。',
+    '- 记忆库里没有、但以前会话说过 → `memory_recall`（全文检索历史会话）。',
+    '- 要重走一条曾经失败过的路径 → 检索时带 `lesson` 关键词。',
+    '没有信号就不查；查不到不是失败，硬用不相关的记忆才是。',
     '',
     '## 什么时候写',
-    '按优先级判断：用户明确说「记住」→ 立即写；用户纠正你或确认你的做法 → 写 rule.*；你踩到坑并找到正确做法 → 写 lesson.*；用户表达了偏好/角色/目标 → 写 user.*；项目状态变化 → 写 task.*。',
-    '默认选**不写**。只有同时满足才写：跨会话仍然成立、代码与文档里看不出来、未来会再次用到。',
+    '三个信号出现就写：① 用户明确说「记住」；② 用户纠正你，或确认了某个非常规做法——「对，就这样」与「别这样」同样重要，只记纠正会让你越来越保守；③ 用户分享了应该跨会话留存的背景（角色、目标、项目决策、外部资源位置）。',
+    '其余情况默认不写；只有三条同时满足才写：跨会话仍然成立、代码与文档里看不出来、未来会再次用到。',
+    '每轮结束会有后台提取器回顾本轮对话、自动沉淀高置信条目：它写过的你不用重复写，你漏掉的它会补。',
+    '被要求记流水账（PR 列表、活动摘要、整段会议记录）时：先追问「哪一点最意外或最不显然」，只记那一条，不照抄全文。',
+    '（软自律，非闸门）一轮对话最多写 3 条，其余留到真的需要时再说。',
     '',
     '## 怎么写',
-    '1. **先查再写**：写之前必须 `memory_search` 同 scope（必要时加 global）的相近 key。已有就更新那一条，不要新建重复条目。',
-    '2. **有矛盾就覆盖，不要并存**：新旧说法冲突时，更新旧条目，并在 value 里显式写「覆盖：<旧说法>」。只有两个事实都仍然成立时才保留两条。',
-    '3. `memory_set(key, value, scope, tags, full)`：同 scope 同 key 直接覆盖更新；key 一旦定下就稳定复用（如 `rule.powershell-encoding`），不要每次换新名。',
-    `4. value 是 ${valueMaxChars} 字以内的自足摘要（会被召回注入，越短越有用）；细节、步骤、长文放 \`full\`；\`links\` 关联同 scope 的其它 key。`,
-    '5. 来不及确定的写法：把「最后验证日期」写进 rule.* 与 env.*，未来好判断它是否过期。',
+    '1. **先查再写**：`memory_set` 之前先 `memory_search` 同 scope（必要时加 global）的相近 key；已有那条就更新，不新建重复条目。',
+    '2. **冲突就覆盖，不并存**：更新旧条目，并在 value 里显式写「覆盖：<旧说法>」；只有两个事实都仍然成立才保留两条。',
+    '3. key 一旦定下就稳定复用（如 `rule.powershell-encoding`），不要每次换新名；`links` 关联同 scope 的其它 key。',
+    '4. value 是自足摘要，也是**检索器的索引**：召回靠词法/二元组匹配，具体名词（文件名、命令、库名、报错词、盘符）保留原样，代词（「那个/上次/问题」）召不回来；先写规则/事实一行，再 **Why:**（为什么这么定）与 **How to apply:**（什么情况下生效）；细节、步骤、长文放 `full`。',
+    '5. 时间一律写**绝对日期**（2026-09-03，不写「昨天/下周」）；`task.*` 尤其要写清推动它的原因。',
+    '6. 会随环境变化的判断（`rule.*`/`env.*`）带上最后验证日期，方便日后判断它是否过期。',
+    '示例：「PowerShell 写中文文件加 -Encoding UTF8（5.1 默认带 BOM）。Why: 不指定会乱码。How to apply: 写中文输出的脚本。」',
     '',
-    '## 分类（key 前缀，memory_set 硬校验）',
-    '- `user.*` 用户画像：称呼/角色/目标/知识背景/偏好/禁忌。一次只记一件事，积累出「用户是谁」；不写负面评判、不写与协作无关的隐私。',
-    '- `rule.*` 工作方式约定：用户给过的指导——包括要避免的**和**要继续的。失败与成功都要记：只记纠正会让你越来越保守、还会偏离用户已经认可的做法。结构：规则一行 → **Why:** → **How to apply:** 何时生效。',
-    '- `task.*` 任务/项目进展与决策：变化快，时间一律写**绝对日期**（2026-09-03，不写「昨天/下周」），并写清推动它的原因；完成后更新状态，过期条目走 `memory_dream` 处理。',
-    '- `project.*` 项目知识**指针**：只记「结论在哪个文件/哪一节 + 为什么这么定」，正文留在项目知识库（cairn / AGENTS.md / 设计文档）里，不要复制进来。',
+    '## 分类（key 前缀 → 记什么）',
+    '- `user.*` 用户画像：称呼/角色/目标/知识背景/偏好/禁忌。一次只记一件事；不写负面评判、不写与协作无关的隐私。',
+    '- `rule.*` 工作方式约定：用户给过的指导——包括要避免的**和**要继续的。结构：规则一行 → **Why:** → **How to apply:** 何时生效。',
+    '- `task.*` 任务/项目进展与决策：变化快，写绝对日期与推动原因；完成后更新状态，过期条目走 `memory_dream`。',
+    '- `project.*` 项目知识**指针**：只记「结论在哪个文件/哪一节 + 为什么这么定」；正文留在项目知识库（cairn / AGENTS.md / 设计文档），不要复制进来。',
     '- `env.*` 环境事实：装了什么、配在哪、去哪查——记位置指针，不抄配置全文；随后可能变化的事实带验证日期。',
-    '- `tool.*` 工具与插件的坑、已知行为、版本限制。',
+    '- `tool.*` / `plugin.*` 工具与插件（含本插件）的坑、已知行为、版本限制。',
     '- `ref.*` 外部资源指针：去哪查（面板入口、文档位置、连接方式）。',
-    '- `auth.*` 凭据：**默认不记**。只有用户明确要求记住时才写；除 auth.* 之外任何前缀都不存明文口令或密钥（闸门会拒绝）——其它地方只记「去哪查」。',
-    '- `lesson.*` 负面知识账本：被证伪的路径与失败教训——记**结果 + 前置条件 + 证据 + 什么条件下解除**。证据变了就更新解除条件，别让一条过期的禁令永远挡路。',
+    '- `auth.*` 凭据：默认不记，只有用户明确要求记住时才写。',
+    '- `lesson.*` 负面知识账本：被证伪的路径与失败教训——记**结果 + 前置条件 + 证据 + 什么条件下解除**；证据变了就更新解除条件，别让一条过期的禁令一直挡路。',
+    'scope：跨项目通用的事实写 `global`；项目专属的写项目名（如 `bd-cluster`），key 前缀仍用上面的分类，不要把项目名塞进 key。',
     '',
-    'scope：跨项目通用的事实用 `global`；项目专属的写项目名（如 `bd-cluster`），此时 key 前缀仍用上面的分类，不要把项目名塞进 key。',
-    '',
-    '## 不要记（按优先级）',
+    '## 不要记（优先级从高到低）',
     '1. 能从当前代码、文件、git 历史推断出来的内容（架构、路径、目录结构、谁改了什么）。',
-    '2. 项目知识库（cairn / AGENTS.md / 技能文档）**已经写下的内容**——那里是唯一真相，记忆里放指针就够了。冲突时以项目知识库为准。',
-    '3. 修复的完整步骤与配方（留在代码、提交信息和文档里，记忆只记「坑在哪 + 怎么绕」）。',
+    '2. 项目知识库（cairn / AGENTS.md / 技能文档）**已经写下的内容**——那里是唯一真相，记忆里放指针就够了；冲突时以知识库为准。',
+    '3. 修复的完整步骤与配方（留在代码、提交信息与文档里；记忆只记「坑在哪 + 怎么绕」）。',
     '4. 只对本次会话有意义的临时状态与进度（用 todo / 计划跟踪）。',
-    '5. 密码、令牌、密钥原文（除用户明确要求写入 `auth.*`）。',
+    '5. 口令、令牌、密钥原文（仅 `auth.*`，且用户明确要求时）。',
+    '这五条即使在你被明确要求记录时也成立：被要求照抄流水账时，追问出那一条非显而易见的发现，比整段复制更有价值。',
     '',
     '## 记忆会过期',
-    '记忆是**某个时点的观察**，不是当前事实。引用其中的文件、路径、命令、版本号之前先验证现状。',
-    '发现记忆与现状冲突时：以现状为准，并立刻修掉记忆——还有用就 `memory_set` 更新，没用了就 `memory_forget` 删除。不要留着已知错误的条目下次再踩。',
+    '记忆是**某个时点的观察**，不是当前事实。当前状态优先看代码与 `git log`，其次才是记忆；引用其中的文件、路径、命令、版本号之前先验证现状，与现状冲突时以现状为准，并立刻修掉记忆——还有用就 `memory_set` 更新，没用了就 `memory_forget` 删除。',
+    '召回行会标注天龄，超过 1 天的会附「时点观察」警告：那是提醒你先验证，不是让你照抄。',
     '`memory_dream` 会列出过期候选（task > 30 天 / 任意 > 90 天 / 已完成 > 14 天），定期跑一次并处理掉。',
     '',
-    '## 写入硬约束（不合规会被拒）',
-    `value ≤${valueMaxChars} 字（超长自动截断为摘要、完整原文归档进 \`full\`，不拒绝）；tags ≤3（超出拒绝）；key 前缀限 \`user/rule/task/ref/env/project/tool/auth/lesson\`（白名单外拒绝）；\`task.*\` 必须含绝对日期。`,
-    '（软自律，非闸门）每轮对话最多写 3 条，其余留到真的需要时再说。',
-    'approveOnSet 开启时，先征得用户同意再带 `confirmed: true` 写入。',
+    '## 硬闸门（违反会被拒绝；清单与代码同源）',
+    `- key 前缀限 ${KEY_PREFIX_LIST}（或与 scope 同名）；项目专属记忆把项目名写进 scope，不要两边都写。`,
+    '- 非 auth.* 前缀不得含明文口令/密钥（闸门拒绝）；tags ≤3 个（超出拒绝）。',
+    `- value ≤${valueMaxChars} 字：超长不拒绝，会自动截断为摘要、完整原文归档进 full（memory_get includeFull 可取回）。`,
+    '- approveOnSet 开启时：先向用户确认，再带 `confirmed: true` 重试写入。',
+    '- 子代理会话写 global 会被拒绝（`scope=sub:<id>` 可用）；成果写进结果报告回传父会话。',
   ].join('\n')
 
   // 精简守则（v0.1.16 引入，v0.1.20 二次压缩 476 → 212 字）：只留三样东西——
@@ -952,6 +998,154 @@ export function apply(ctx: Context, config: Config): void {
     return header.origin === 'subagent'
       || depth > 0
       || Boolean(header.parentSession ?? header.parentId)
+  }
+
+  // ── 轮末自动提取（对标 Claude Code extractMemories：AI 用 AI 写记忆）────────
+  // 订阅 session/event 火线缓冲每个会话当前 turn 的文本；agent/turn-stopping 时
+  // 异步调 LLM 提取高置信候选，过最小闸门后落盘。互斥：主 agent 30s 内手动写过
+  // 记忆 → 跳过；提取中 → 跳过；冷却内 → 跳过。两个监听器都绝不抛错。
+  const turnBuffers = new Map<string, string[]>()
+  const lastExtractAt = new Map<string, number>()
+  const lastManualWriteAt = new Map<string, number>()
+  let extractionInFlight = false
+
+  /** 提取器落盘路径：与 memory_set 同源的最小闸门（前缀白名单/凭据词/value 截断/tags 裁剪）。
+   *  @returns 是否真的写入（被闸门拦截返回 false，调用方继续尝试下一条候选）。 */
+  async function writeExtractedMemory(raw: { key?: unknown; value?: unknown; tags?: unknown[] }): Promise<boolean> {
+    const key = String(raw.key ?? '').trim()
+    if (!key) return false
+    const prefix = key.split('.')[0].toLowerCase()
+    if (!KEY_PREFIX_WHITELIST.includes(prefix)) return false
+    if (prefix === 'auth') return false
+    let value = String(raw.value ?? '').trim()
+    if (!value) return false
+    if (/password|passwd|密码|口令|密钥/i.test(value)) return false
+    if (value.length > valueMaxChars) value = truncate(value, valueMaxChars)
+    const tags = Array.isArray(raw.tags) ? raw.tags.map((t) => String(t)).filter(Boolean).slice(0, 3) : []
+    const now = new Date().toISOString()
+    await withLock(async () => {
+      const items = await readItems()
+      const idx = items.findIndex((item) => item.scope === defaultScope && item.key === key)
+      if (idx >= 0) {
+        const prev = items[idx]
+        items[idx] = { ...prev, value, tags: tags.length ? tags : prev.tags, updatedAt: now, source: '轮末提取' }
+      } else {
+        items.push({ id: makeId(), key, value, scope: defaultScope, tags, createdAt: now, updatedAt: now, source: '轮末提取' })
+      }
+      await writeItems(items)
+    })
+    return true
+  }
+
+  const EXTRACTION_SYSTEM_PROMPT = [
+    '你是记忆提取器：回顾一段对话，只提取值得跨会话保留的条目，宁缺毋滥——拿不准就返回空列表。',
+    '提取判据（三条同时满足才提）：① 跨会话仍然成立（用户偏好/纠正、踩坑与正解、项目决策与背景）；② 从当前代码、文件、git 历史看不出来；③ 未来对话真的会用到。',
+    '不提取：临时进度、完整修复步骤、可推导内容、流水账（PR 列表/活动摘要）；口令密钥一律不提取。',
+    `key 前缀限 ${KEY_PREFIX_LIST}；rule.*/lesson.* 的 value 用「规则一行 + Why: + How to apply:」结构；task.* 写绝对日期；value 保留具体名词（文件名/命令/报错词），不用代词。`,
+    '最多 1 条。只输出 JSON：{"memories":[{"key":"前缀.名","value":"自足摘要","tags":["标签"]}]}',
+  ].join('\n')
+
+  async function extractAndWrite(sid: string, dialogue: string): Promise<void> {
+    const llm = ctx.get('llm') as any
+    if (!llm) return
+    const sel = (ctx.get('agentDefaultModel') as any)?.currentSelection?.() as { provider?: string; model?: string } | undefined
+    const provider = sel?.provider
+    const model = sel?.model
+    if (!provider || !model) return
+    const timeout = AbortSignal.timeout(5000)
+    const textChunks: string[] = []
+    try {
+      const stream = llm.stream({
+        provider,
+        model,
+        system: EXTRACTION_SYSTEM_PROMPT,
+        maxTokens: 300,
+        temperature: 0,
+        signal: timeout,
+        messages: [{
+          id: `mid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          role: 'user',
+          content: [{ type: 'text', text: `对话摘录：\n${dialogue}` }],
+          source: { kind: 'plugin', plugin: name },
+        }],
+      })
+      for await (const chunk of stream) {
+        if (chunk?.type === 'text-delta') textChunks.push(chunk.text)
+      }
+    } catch (err) {
+      ctx.logger.debug('[mem] extract llm failed: %o', err)
+      return
+    }
+    const text = textChunks.join('').trim()
+    const m = text.match(/\{[\s\S]*\}/)
+    if (!m) return
+    let parsed: any
+    try { parsed = JSON.parse(m[0]) } catch { return }
+    const memories = Array.isArray(parsed?.memories) ? parsed.memories : []
+    let written = 0
+    for (const cand of memories.slice(0, 3)) {
+      if (written >= 1) break
+      try {
+        if (await writeExtractedMemory(cand)) written += 1
+      } catch (err) {
+        ctx.logger.debug('[mem] extract write failed: %o', err)
+      }
+    }
+  }
+
+  if (autoExtract) {
+    // ① 火线缓冲：每会话当前 turn 的文本（user/message 与 assistant/message）
+    ctx.on('session/event', (session: any, event: any) => {
+      try {
+        if (!session?.id || !event) return
+        const sid = String(session.id)
+        if (event.type === 'turn/start') {
+          turnBuffers.set(sid, [])
+          return
+        }
+        let text = ''
+        if (event.type === 'user/message') {
+          const blocks = Array.isArray(event.data?.content) ? event.data.content : []
+          text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => b.text ?? '').join('\n')
+        } else if (event.type === 'assistant/message') {
+          const blocks = Array.isArray(event.data?.message?.content) ? event.data.message.content : []
+          text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => b.text ?? '').join('\n')
+        }
+        text = text.trim()
+        if (!text) return
+        const buf = turnBuffers.get(sid)
+        if (!buf) return
+        buf.push(text.slice(0, 2000))
+        if (buf.length > 30) buf.splice(0, buf.length - 30)
+        if (turnBuffers.size > 64) {
+          const oldest = turnBuffers.keys().next().value
+          if (oldest !== undefined) turnBuffers.delete(oldest)
+        }
+      } catch { /* 观察者绝不抛 */ }
+    }, { global: true })
+
+    // ② 轮末触发：异步提取（serial 监听器立即返回，不拖慢 turn 收尾）
+    ctx.on('agent/turn-stopping', (payload: any) => {
+      try {
+        const agent = payload?.agent
+        if (!agent || isSubagentAgent(agent)) return
+        if (extractionInFlight) return
+        const sid = String(agent.session?.id ?? '')
+        if (!sid) return
+        const now = Date.now()
+        const last = lastExtractAt.get(sid)
+        if (last !== undefined && now - last < autoExtractCooldownMs) return
+        const manual = lastManualWriteAt.get(sid)
+        if (manual !== undefined && now - manual < 30_000) return
+        const buf = turnBuffers.get(sid)
+        if (!buf || buf.length === 0) return
+        lastExtractAt.set(sid, now)
+        extractionInFlight = true
+        void extractAndWrite(sid, buf.join('\n').slice(-4000))
+          .catch((err) => ctx.logger.debug('[mem] extract failed: %o', err))
+          .finally(() => { extractionInFlight = false })
+      } catch { /* 观察者绝不抛 */ }
+    }, { global: true })
   }
 
   if (autoRecall || autoCapture) {
@@ -1012,8 +1206,7 @@ export function apply(ctx: Context, config: Config): void {
         // ② 教训/规则通道：悔恨信号（又错了/还是失败）或场景信号（路径/终端/命令）
         //    触发时强制召回 rule.*/教训/坑/修复类记忆，**不受 autoRecallOnce 限制**——
         //    这是"AI 经常犯同样错"的直接解药：错误发生时立刻把上次的坑摆到眼前。
-        //    独立冷却（120s）防刷屏，不污染常规召回的一次性配额。
-        let lessonInjected = false
+        const lessonKeys = new Set<string>()
         if (autoRecall) {
           const items = excludeAuth(await withLock(async () => readItems()))
           const { query } = extractQuery(payload.messages)
@@ -1027,7 +1220,7 @@ export function apply(ctx: Context, config: Config): void {
             // v0.1.20 修：渲染格式是 `[scope/key · N 天前]`，key 后面还跟着 " · 天数"，
             // 旧 marker `[scope/key]` 永远匹配不到 → 去重形同虚设（实测同一条教训相隔 6 分钟
             // 被原样注入两次，白烧 503 字）。marker 保留到 " ·" 之前即可稳定命中。
-            const lessons = pickLessonItems(items, isRegret, isRule, 2)
+            const lessons = pickLessonItems(items, query, isRegret, isRule, 2)
             const fresh = lessons.filter((item) => {
               const marker = `[${item.scope}/${item.key} ·`
               return !entered.some((m) => JSON.stringify(m).includes(marker))
@@ -1046,7 +1239,7 @@ export function apply(ctx: Context, config: Config): void {
               }
               sessionInjections.set(lessonKey, Date.now())
               persistInjectionState()
-              lessonInjected = true
+              for (const item of fresh) lessonKeys.add(`${item.scope}/${item.key}`)
               changed = true
             }
           }
@@ -1060,7 +1253,11 @@ export function apply(ctx: Context, config: Config): void {
             || (!autoRecallOnce && Date.now() - lastInjection >= autoRecallCooldownMs)
           if (recallAllowed) {
             const { query, hasImage } = extractQuery(payload.messages)
-            const items = excludeAuth(await withLock(async () => readItems()))
+            const all = excludeAuth(await withLock(async () => readItems()))
+            // 教训通道已给过内容的条目不再重复召回：同一条记忆在同一会话里出现两次纯属浪费。
+            const items = lessonKeys.size > 0
+              ? all.filter((item) => !lessonKeys.has(`${item.scope}/${item.key}`))
+              : all
             if (items.length > 0) {
               const isFirstTurn = payload.step === 1
               const recalled = pickRecallItems(items, query, autoRecallLimit, autoRecallFallback, isFirstTurn, hasImage)
@@ -1109,14 +1306,15 @@ export function apply(ctx: Context, config: Config): void {
         }
 
         // ④ 索引兜底：首轮没有任何召回且不是看图提问 → 注入索引而不是画像（v0.1.6）
-        // 只看 教训/召回 两通道是否已注入：① 守则注入不算——守则 + 索引同现正是验收预期（新会话"你好"）。
+        // 教训通道不再阻止索引：它给的是「可能是坑的内容」，索引给的是「库里还有什么」；
+        // 教训通道命中的条目会从目录里排除，两者不重复。
         if (autoRecall && payload.step === 1 && !isSubagentAgent(payload.agent)) {
           const { hasImage } = extractQuery(payload.messages)
           const idxKey = `${sid}:index`
-          if (!hasImage && !sessionInjections.has(idxKey) && !lessonInjected && recallEmpty) {
+          if (!hasImage && !sessionInjections.has(idxKey) && recallEmpty) {
             const items = await withLock(async () => readItems())
-            if (items.length > 0) {
-              const text = buildIndexBlock(items)
+            const text = items.length > 0 ? buildIndexBlock(items, lessonKeys) : ''
+            if (text) {
               entered.splice(lastClaimedIndex + 1 + (changed ? 1 : 0), 0, {
                 role: 'user',
                 id: makeId(),
@@ -1211,18 +1409,17 @@ export function apply(ctx: Context, config: Config): void {
         full = full ? `${full}\n\n${raw}` : raw
         warnings.push(`value 摘要 ${raw.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
       }
-      // ── 写侧闸门（v0.1.7）：把守则的执行纪律变成硬约束 ──────────────
-      const KEY_PREFIX_WHITELIST = ['user', 'rule', 'task', 'ref', 'env', 'project', 'tool', 'auth', 'lesson', 'plugin']
+      // ── 写侧闸门（v0.1.7）：实测闸门；文案与守则同源（KEY_PREFIX_LIST 在模块顶部）──
       const prefix = key.split('.')[0]
       if (!KEY_PREFIX_WHITELIST.includes(prefix) && prefix !== scope) {
-        throw new Error(`memory_set: key 前缀 "${prefix}" 不在分类白名单（user/rule/task/ref/env/project/tool/auth/lesson）。项目专属记忆请把项目名写进 scope 参数、key 前缀用标准分类（如 task.xxx 配 scope=项目名）；确需项目名前缀时 scope 须与 key 前缀一致。`)
+        throw new Error(`memory_set: key 前缀 "${prefix}" 不在分类白名单（${KEY_PREFIX_LIST}）。项目专属记忆请把项目名写进 scope 参数、key 前缀用标准分类（如 task.xxx 配 scope=项目名）；确需项目名前缀时 scope 须与 key 前缀一致。`)
       }
       if (tags.length > 3) {
         throw new Error(`memory_set: tags 最多 3 个（当前 ${tags.length} 个）。请收敛到最能代表内容的 1-3 个标签。`)
       }
       if (prefix !== 'auth') {
         const body = `${args.value}\n${args.full ?? ''}`
-        if (/password|passwd|\b密码\b|\b口令\b|\b密钥\b/i.test(body)) {
+        if (/password|passwd|密码|口令|密钥/i.test(body)) {
           throw new Error('memory_set: 检测到疑似明文密码/密钥。凭据类记忆请用 auth.* 前缀（用户授权保留）；其他前缀一律只记指针（去哪查），不记明文。')
         }
         if (/token|secret|api[_-]?key/i.test(body)) {
@@ -1282,6 +1479,7 @@ export function apply(ctx: Context, config: Config): void {
           created = true
         }
         await writeItems(items)
+        if (sessionId) lastManualWriteAt.set(sessionId, Date.now())
         return { ok: true, key, scope, created, mergedKey, updatedAt: now, ...(warnings.length ? { warnings } : {}) }
       })
     },

@@ -51,6 +51,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
 | LLM 语义重排 | 候选 ≥2 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
 | 教训通道 | 悔恨信号（「又错/还是失败」）或场景信号（路径/盘符/终端/命令）时**不受每会话一次限制**强制召回 rule.*/lesson.*，独立 120s 冷却——错误发生时把上次的坑摆到眼前。同一条在本会话历史里出现过就不再注入（v0.1.20 修 marker 格式，此前去重形同虚设） |
+| 轮末自动提取 | 每轮结束（`agent/turn-stopping`）异步回顾对话、LLM 提取高置信记忆自动沉淀（对标 Claude Code extractMemories：AI 用 AI 写记忆，不依赖主模型当轮意愿）。互斥：主 agent 30s 内手动写过则跳过；提取中不重入；同会话 120s 冷却；fire-and-forget 不阻塞回合收尾。写入走与 memory_set 同源的最小闸门（前缀白名单 + 明文凭据拦截），auth.* 一律不提取，`source=轮末提取` |
 | 记忆索引兜底 | 首轮 0 召回时注入动态【记忆索引】，**只列 key 不列摘要**（global 4 个：user.* 画像固定 2 席 + 其余最新 2 席；工作区 scope 各 3 个；v0.1.20 实测 424 → 约 160 字），不落盘；索引注入后本会话不再补召回，避免两套重叠（v0.1.20） |
 | 新鲜度标注 | 每条召回显示天龄（今天/昨天/N 天前）；>1 天附漂移警告——时点观察，点名文件/路径引用前先验证现状 |
 | 来源引证 | `memory_set` 自动填「日期+会话 id」，召回行展示 `· 自2026-09-01 s=xxx` |
@@ -114,7 +115,9 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
         rrfRecall: true             # RRF 混合召回（词法 0 命中语义补位）
         rrfFirstTurnOnly: true      # 补位只在首轮（非首轮词法被阈值过滤 = 整体不相关，宁可不注入）
         autoCapture: true           # 每会话注入记忆守则
-        autoCaptureDetail: brief    # 守则详略：brief（默认，约 210 字）| full（完整九类细则约 1300 字）
+        autoExtract: true           # 轮末自动提取（默认开，可在 cordis.yml 关闭）
+        autoExtractCooldownMs: 120000  # 同一会话提取冷却（默认 120s）
+        autoCaptureDetail: full     # 守则详略：full（默认，完整守则约 2760 字）| brief（精简版约 210 字）
         autoRecallBudgetChars: 300  # 单次召回注入字符预算（默认 300 ≈ 1 条），超出按分数截断
         autoRecallMinScore: 3       # 非首轮召回的绝对分数下限（原 1 过松，会注入无关记忆）
         autoRecallRelativeFloor: 0.5 # 相对阈值：低于最高分该比例的记忆不注入；0 禁用
