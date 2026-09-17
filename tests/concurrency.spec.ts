@@ -220,6 +220,65 @@ describe('B3 写锁等价性（S6/S9 回归）', () => {
     expect(await exists(lock + '.reap'), '清除陈旧锁的临界区文件泄漏了').toBe(false)
   })
 
+  // ── T9：陈旧锁清除的亚毫秒窗口（二次校验能否救回活锁）────────────────────────
+  // 触发条件：持锁者停摆 >10s（心跳停了，mtime 看起来很老），随后恰好在清除者的
+  // 「第一次 stat 之后、unlink 之前」恢复心跳刷新 mtime。这里用注入把刷新精确塞进该窗口：
+  // 清除者必须放弃本轮清除（第二次 stat 读到新鲜 mtime），而不是删掉这把其实活着的锁。
+  it('T9：持锁者停摆 >10s 后恢复心跳 → 陈旧锁不得被误清（刷新救回）', async () => {
+    const dir = mkdirs()
+    const file = join(dir, 'memory.jsonl')
+    const lock = lockPathOf(file)
+    const reap = lock + '.reap'
+    const old = (Date.now() - 60_000) / 1000
+    await fsp.writeFile(lock, JSON.stringify({ pid: 999999, token: 'slow-holder' }), 'utf8')
+    await fsp.utimes(lock, old, old)               // 持锁者停摆 >10s：mtime 看起来已经陈旧
+    let injected = false
+    let reapsTaken = 0
+    let releaseHolder: () => void = () => {}
+    const holderReleased = new Promise<void>((resolve) => { releaseHolder = resolve })
+    const unlinkedTokens: Array<string | null> = []
+    const fsB: StoreFs = {
+      ...realFs,
+      stat: async (p) => {
+        const st = await realFs.stat(p)
+        if (p === lock && !injected) {
+          injected = true
+          // 清除者的第一次 stat 已经拿到「陈旧」快照；在它 open(reap) 与第二次 stat 之前，
+          // 持锁者恢复心跳刷新 mtime —— 这正是 T9 的亚毫秒窗口
+          await fsp.utimes(lock, new Date(), new Date())
+          setTimeout(() => { releaseHolder() }, 120)   // 持锁者恢复正常后收尾释放锁
+        }
+        return st
+      },
+      open: (p, f) => {
+        if (p === reap && f === 'wx') reapsTaken += 1
+        return realFs.open(p, f)
+      },
+      unlink: async (p) => {
+        if (p === lock) {
+          const cur = await readLock(lock)
+          unlinkedTokens.push(cur ? (cur.token as string | null) : null)
+        }
+        return realFs.unlink(p)
+      },
+    }
+    const storeB = mkStore(fsB, dir, file)
+    const items = await storeB.readItems()
+    items.push(item('rule.from-b'))
+    const pending = storeB.writeItems(items)
+    void pending.catch(() => { /* 断言提前失败时不要变成 unhandled rejection */ })
+    void holderReleased.then(() => fsp.rm(lock, { force: true }))
+    await pending
+    expect(injected, '注入未生效：B 没有走到陈旧锁判断').toBe(true)
+    expect(reapsTaken, 'B 没有进入清除临界区：本用例没有覆盖到二次校验').toBeGreaterThan(0)
+    expect(unlinkedTokens, 'B 删掉了「仍在刷新」的持锁者的锁（T9：二次校验没挡住刷新后的锁）').not.toContain('slow-holder')
+    expect(unlinkedTokens.length, 'B 只应删除自己的锁').toBe(1)
+    expect(await exists(lock), 'B 写入完成后未释放自己的锁').toBe(false)
+    expect(await exists(reap), '清除临界区文件泄漏').toBe(false)
+    const final = await mkStore(realFs, dir, file).readItems()
+    expect(final.map((i) => i.key)).toEqual(['rule.from-b'])
+  }, 15_000)
+
   it('S9b：rename 之前刷新锁 mtime（长写不被误判陈旧而抢锁）', async () => {
     const dir = mkdirs()
     const file = join(dir, 'memory.jsonl')
@@ -341,7 +400,7 @@ describe('B3 写锁等价性（S6/S9 回归）', () => {
 const CHILD_SOURCE = [
   "import { promises as fsp } from 'node:fs'",
   "import { pathToFileURL } from 'node:url'",
-  "const [srcPath, dataDir, dataFile, prefix, countRaw] = process.argv.slice(2)",
+  "const [srcPath, dataDir, dataFile, prefix, countRaw, attemptsRaw] = process.argv.slice(2)",
   "const { createStore, withConflictRetry } = await import(pathToFileURL(srcPath).href)",
   "const fs = {",
   "  stat: (p) => fsp.stat(p),",
@@ -355,21 +414,32 @@ const CHILD_SOURCE = [
   "}",
   "const store = createStore({ fs, dataDir, dataFile, defaultScope: 'global' })",
   "const count = Number(countRaw)",
+  "const attempts = attemptsRaw ? Number(attemptsRaw) : 40",
   "const iso = '2026-09-17T00:00:00.000Z'",
   "let lockSeen = 0",
+  "let conflicts = 0",
+  "const conflictKinds = {}",
+  "const bump = (err) => {",
+  "  conflicts += 1",
+  "  const m = String((err && err.message) || err)",
+  "  const k = m.includes('写锁已被其他进程接管') ? 'lock-stolen' : m.includes('正被其他进程替换') ? 'rename-race' : m.includes('已被其他进程修改') ? 'version' : m.includes('无法获取') ? 'lock-timeout' : 'other'",
+  "  conflictKinds[k] = (conflictKinds[k] || 0) + 1",
+  "}",
   "const parsePid = (raw) => { try { const v = JSON.parse(raw); return v && typeof v === 'object' ? v.pid : v } catch { return null } }",
   "const sampler = setInterval(() => {",
   "  void fsp.readFile(dataFile + '.lock', 'utf8').then((raw) => { const pid = parsePid(raw); if (pid !== null && pid !== process.pid) lockSeen += 1 }, () => {})",
   "}, 2)",
+  "const started = Date.now()",
   "for (let i = 0; i < count; i++) {",
   "  await withConflictRetry(async () => {",
   "    const items = await store.readItems()",
   "    items.push({ id: prefix + '-id-' + i, key: prefix + '.' + i, value: 'v' + i, scope: 'global', tags: [], createdAt: iso, updatedAt: iso })",
-  "    await store.writeItems(items)",
-  "  }, 40)",
+  "    try { await store.writeItems(items) } catch (err) { bump(err); throw err }",
+  "  }, attempts)",
   "}",
+  "const elapsedMs = Date.now() - started",
   "clearInterval(sampler)",
-  "process.stdout.write(JSON.stringify({ pid: process.pid, lockSeen }))",
+  "process.stdout.write(JSON.stringify({ pid: process.pid, lockSeen, conflicts, conflictKinds, elapsedMs, writes: count }))",
 ].join('\n')
 
 function runChild(childPath: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -404,4 +474,62 @@ describe('B3 真实跨进程互斥', () => {
       .reduce((x, y) => x + y, 0)
     expect(seen, '两个子进程从未观察到对方持锁：它们没有在同一把锁上竞争').toBeGreaterThan(0)
   }, 30_000)
+})
+
+// ── T13：B3 压力量化（不做 WAL 迁移，先用数字说话）────────────────────────────
+// 交付物是数字：最终条数 / 丢更新数 / 冲突次数与冲突类型 / 墙钟耗时。
+// 本机基线（i5-13500 / 20 核 / Node 26.8.1 / NVMe）：5×200 全程约 8.0~8.1s、1000 条无丢更新、
+// 冲突 39~50 次（冲突率 3.8%~4.8%，全部为 size/mtime 版本冲突，锁超时/rename 竞争/锁被抢均为 0）。
+// 若哪天这里明显劣化（冲突率飙升或出现 lock-timeout），才是迁移到 WAL 的信号。
+describe('B3 压力量化（T13）', () => {
+  it('5 个子进程 × 200 条不同 key → 最终 1000 条无丢更新，并输出冲突率与耗时', async () => {
+    const dir = mkdirs()
+    const file = join(dir, 'memory.jsonl')
+    const childPath = join(dir, 'fork-writer.mjs')
+    writeFileSync(childPath, CHILD_SOURCE, 'utf8')
+    const srcPath = fileURLToPath(new URL('../src/store.ts', import.meta.url))
+    const prefixes = ['a', 'b', 'c', 'd', 'e']
+    const perChild = 200
+    const totalWrites = prefixes.length * perChild
+    const wallStart = Date.now()
+    // 每个子进程显式放大重试预算（200）：这里要量化的是冲突代价，不是默认 5 次预算是否够用
+    const results = await Promise.all(prefixes.map((prefix) =>
+      runChild(childPath, [srcPath, dir, file, prefix, String(perChild), '200'])))
+    const wallMs = Date.now() - wallStart
+    results.forEach((r, i) => {
+      expect(r.code, '子进程 ' + prefixes[i] + ' 失败：' + r.stderr).toBe(0)
+    })
+    const stats = results.map((r) => JSON.parse(r.stdout || '{}') as {
+      lockSeen?: number; conflicts?: number; conflictKinds?: Record<string, number>; elapsedMs?: number
+    })
+    const final = await mkStore(realFs, dir, file).readItems()
+    const keys = new Set(final.map((i) => i.key))
+    const totalConflicts = stats.reduce((sum, s) => sum + (s.conflicts ?? 0), 0)
+    const kinds: Record<string, number> = {}
+    for (const s of stats) {
+      for (const [k, v] of Object.entries(s.conflictKinds ?? {})) kinds[k] = (kinds[k] ?? 0) + v
+    }
+    // 交付物：把量化数字打进测试输出（T13 报告口径）
+    console.log('[T13] ' + JSON.stringify({
+      workers: prefixes.length, perChild, totalWrites, wallMs,
+      rows: final.length, uniqueKeys: keys.size, lostUpdates: totalWrites - keys.size,
+      conflicts: totalConflicts,
+      conflictRate: Number((totalConflicts / (totalWrites + totalConflicts)).toFixed(4)),
+      conflictKinds: kinds,
+      perChild: stats.map((s, i) => ({ prefix: prefixes[i], conflicts: s.conflicts ?? -1, elapsedMs: s.elapsedMs ?? -1 })),
+    }))
+    // 无丢更新、无重复：这是 B3 的核心断言
+    expect(final).toHaveLength(totalWrites)
+    expect(keys.size, '出现重复 key 或丢更新').toBe(totalWrites)
+    for (const prefix of prefixes) {
+      expect(final.filter((i) => i.key.startsWith(prefix + '.')).length, '子进程 ' + prefix + ' 的写入有丢失').toBe(perChild)
+    }
+    // 压力确实落在互斥路径上：子进程必须观察到过别人持锁
+    expect(stats.reduce((sum, s) => sum + (s.lockSeen ?? 0), 0), '子进程从未观察到别人持锁：压力没有落到锁竞争上').toBeGreaterThan(0)
+    // 冲突必须全部落在已知类型里：出现 unknown 说明多了一种未分析的失败形态（WAL 决策要重新评估）
+    const known = new Set(['version', 'rename-race', 'lock-stolen', 'lock-timeout'])
+    for (const k of Object.keys(kinds)) {
+      expect(known.has(k), '出现了未归类的冲突类型：' + k).toBe(true)
+    }
+  }, 180_000)
 })
