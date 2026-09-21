@@ -23,7 +23,7 @@ import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import { KEY_PREFIX_LIST, KEY_PREFIX_WHITELIST } from './types.js'
 import type { MemoryItem } from './types.js'
-import { escapeMemoryAttr, sanitizeValue } from './sanitize.js'
+import { escapeMemoryAttr, neutralizeMemoryDataDelimiters, sanitizeValue } from './sanitize.js'
 import {
   ageLabel,
   bigramJaccard,
@@ -1490,16 +1490,33 @@ export function apply(ctx: Context, config: Config): void {
           value: { type: 'string' },
           full: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
+          links: { type: 'array', items: { type: 'string' } },
+          source: { type: 'string' },
           updatedAt: { type: 'string' },
           masked: { type: 'boolean' },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.found
-          ? `<memory-data trust="untrusted" scope="${escapeMemoryAttr(value.scope)}" key="${escapeMemoryAttr(value.key)}">记忆 ${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}：${value.value}${value.masked ? '（凭据已掩码）' : ''}${value.full ? '\n(已附完整正文)' : ''}${value.tags?.length ? `（标签：${value.tags.join(', ')}）` : ''}</memory-data>`
-          : `未找到记忆：${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}`,
-      }],
+      render: (_args, value) => {
+        if (!value.found) return [{ type: 'text', text: `未找到记忆：${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}` }]
+        // N2（第七轮收口）：进模型上下文的只有 render 的产物——DSH 的 tool/result 只取 result.content
+        // （packages/core/agent-loop/src/tool-calls.ts:277-281），canonical value 到不了模型。
+        // 修复前这里打印的是占位符「(已附完整正文)」，于是 README 承诺的 includeFull 取回路径对模型是断的；
+        // links 更是 schema 与 render 双缺，模型读不回一条记忆的关联 key（却能用 [] 清空它）。
+        const neutral = (s: unknown) => neutralizeMemoryDataDelimiters(String(s))
+        const meta = [
+          value.updatedAt ? `更新于 ${neutral(value.updatedAt)}` : '',
+          value.source ? `来源 ${neutral(value.source)}` : '',
+          value.tags?.length ? `标签 ${value.tags.map(neutral).join(', ')}` : '',
+          value.links?.length ? `关联 ${value.links.map(neutral).join(', ')}` : '',
+        ].filter(Boolean).join(' · ')
+        const body = [
+          `记忆 ${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}：${value.value}`,
+          ...(meta ? [meta] : []),
+          ...(value.masked ? ['（凭据已掩码：默认不返回原文，需部署者开启 allowCredentialReveal 且 confirmed:true）'] : []),
+          ...(value.full ? ['--- 完整正文 ---', value.full] : []),
+        ].join('\n')
+        return [{ type: 'text', text: `<memory-data trust="untrusted" scope="${escapeMemoryAttr(value.scope)}" key="${escapeMemoryAttr(value.key)}">${body}</memory-data>` }]
+      },
     },
     async execute(args: { key: string; scope?: string; includeFull?: boolean; confirmed?: boolean }, exec?: any) {
       const key = String(args.key || '').trim()
@@ -1529,6 +1546,8 @@ export function apply(ctx: Context, config: Config): void {
           ...(includeFull && item.full && !masked ? { full: sanitizeValue(item.full) } : {}),
           ...(masked ? { masked: true } : {}),
           tags: item.tags,
+          ...(item.links?.length ? { links: item.links } : {}),
+          ...(item.source ? { source: item.source } : {}),
           updatedAt: item.updatedAt,
         }
       })

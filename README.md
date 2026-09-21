@@ -71,7 +71,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 ## 模型工具
 
 - `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）；库达 `maxItems`（默认 2000）后拒绝**新增**（更新已有 key 不受限），错误提示跑 `memory_dream`；`/memory restore` 作为救援通道不受此限；内容与旧值**全等**时按空操作处理（T17）：不刷新 `updatedAt`、不落盘，返回 `changed: false`，工具文本报「已确认」——避免反复重申让旧记忆伪装新鲜，污染召回排序与 `memory_dream` 的过期判定
-- `memory_get` — 按 key 读取（`includeFull` 才返回完整正文；凭据类条目默认掩码，需部署者 `allowCredentialReveal: true` 且带 `confirmed: true` 才可能取回原文）
+- `memory_get` — 按 key 读取：返回 `value`、`tags`、`links`（关联 key）、`updatedAt` 与 `source` 引证，`includeFull: true` 时**同时把完整正文交给模型**（N2 修复：DSH 的 tool/result 只取 `output.render()` 的产物，`canonical value` 到不了模型，此前 render 只打印占位符「(已附完整正文)」——README 承诺的取回路径实际是断的）；凭据类条目默认掩码，需部署者 `allowCredentialReveal: true` 且带 `confirmed: true` 才可能取回原文
 - `memory_search` — 关键词/标签/作用域搜索
 - `memory_forget` — 删除一条
 - `memory_stats` — 记忆库概况
@@ -190,7 +190,7 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 
 ## 隐私与数据边界
 
-- **记忆内容会进入模型上下文**：`memory_get` / `memory_search` 返回的 `value` 与 `full` 作为工具结果进入会话上下文，并随该会话的请求发送至配置的 LLM provider（当前默认 provider 为 `deepseek-official`）；记忆库本身只落盘在本地 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`，插件不向其它服务发送记忆数据。
+- **记忆内容会进入模型上下文**：`memory_get` 返回的 `value`、`tags`、`links`、`updatedAt`、`source`，以及 `includeFull: true` 时的 `full`；`memory_search` 返回的 `value`——都作为工具结果进入会话上下文，并随该会话的请求发送至配置的 LLM provider（当前默认 provider 为 `deepseek-official`）；记忆库本身只落盘在本地 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`，插件不向其它服务发送记忆数据。
 - **自动注入通道已排除凭据**：`auth.*` 前缀条目，以及 `value` 命中凭据正则（token / secret / api key / bearer / sk- / ghp_ / AKIA / PRIVATE KEY / 中文口令）或命中 `redactPatterns` 自定义敏感词的条目，都不参与自动注入（召回 / 教训 / 索引；凭据类记忆只在模型显式 `memory_search` / `memory_get` 时返回）。模型显式调用时主会话读到的 `auth.*`/`凭据类条目`默认是**掩码**；子代理会被硬层拒绝。
 - **`confirmed` 是模型自述，不构成用户授权**：`memory_get` 的 `confirmed: true` 由模型自己填写，没有任何用户审批通道介入。因此默认配置下**即使带 `confirmed: true` 也只返回掩码**（`allowCredentialReveal` 默认 `false`）；只有部署者在 cordis 配置里显式写 `allowCredentialReveal: true`（视为部署者授权）才开放取回原文的路径。
 - **导出文件是明文**：`/memory export` 会把整库（含 `auth.*` 明文凭据与所有 `full` 正文）写入你指定的文件，仅本地落盘、插件不上传，但请自行保管该文件。
