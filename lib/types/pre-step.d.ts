@@ -2,7 +2,8 @@
  * pre-step 注入四通道（第 2 批拆分；原 index.ts apply() 闭包）。
  *
  * 通道顺序：守则（每会话首轮一次）→ 教训/规则 → 召回（词法 + RRF + 可选 LLM 重排）→ 索引兜底，
- * 共享会话级总预算 injectionBudgetChars；守则不计入预算（它永不被砍）。
+ * 共享**每轮**总预算 injectionBudgetChars（每次 pre-step 重新起算，不是会话级累计）；
+ * 守则不计入预算（它永不被砍）。
  *
  * deps 化说明：原先这些函数闭包在 apply() 上（scoreEnv/recallEnv、rerankMemories、
  * isOwnInjected/AUTO_CAPTURE_FORM/sessionQueryAvailable/buildGuideText 与 pre-step 监听器）。
