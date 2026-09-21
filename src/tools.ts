@@ -29,7 +29,7 @@ export function registerTools(ctx: Context, deps: MemoryDeps, writeOps: WriteOps
   // ── memory_set：写入/更新一条记忆 ──────────────────────────────────────
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_set',
-    description: '持久化写入一条记忆（用户偏好/项目事实/任务状态）。同 scope+key 会覆盖更新；长文用 full（仅 memory_get includeFull 返回），value 写自足摘要。',
+    description: '持久化写入一条记忆。**何时写**：用户说「记住」、纠正或确认了某个做法、交代了应跨会话留存的背景（角色/目标/项目决策/资源位置）——出现这类信号，且内容「跨会话仍成立 + 代码与 git 里看不出 + 未来会再用」三条全过才写；能从代码/历史推断的、流水账、一次性进度都不要写。同 scope+key 覆盖更新；长文用 full（仅 memory_get includeFull 返回），value 写自足摘要。',
     parameters: {
       key: { type: 'string', required: true, description: '记忆键，如 user.name / project.tech' },
       value: { type: 'string', required: true, description: '记忆摘要：召回/搜索只展示它' },
@@ -93,7 +93,7 @@ export function registerTools(ctx: Context, deps: MemoryDeps, writeOps: WriteOps
   // ── memory_get：按 key 读取 ───────────────────────────────────────────
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_get',
-    description: '按 key（可带 scope）读取一条持久记忆；includeFull 获取长文完整内容。',
+    description: '按 key（可带 scope）读取一条持久记忆：memory_search 命中后用它读细节；includeFull 获取长文完整内容。',
     parameters: {
       key: { type: 'string', required: true, description: '记忆键' },
       scope: { type: 'string', description: '作用域，默认 global' },
@@ -191,7 +191,7 @@ export function registerTools(ctx: Context, deps: MemoryDeps, writeOps: WriteOps
   // ── memory_search：按关键词/标签搜索 ─────────────────────────────────
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_search',
-    description: '搜索持久记忆：按关键词（匹配 key/value/tags/scope）或标签过滤，返回最多 limit 条。',
+    description: '搜索持久记忆。**何时查**：用户提到你不可能记得的事（「上次」「之前那个」「我说过的」），或抱怨同一件事又做错（带上 lesson 关键词，先看上次是怎么栽的）。按关键词（匹配 key/value/tags/scope）或标签过滤，返回最多 limit 条。',
     parameters: {
       query: { type: 'string', description: '关键词，留空则只按 tags/scope 过滤' },
       scope: { type: 'string', description: '限定作用域' },
