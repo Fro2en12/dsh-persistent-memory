@@ -44,8 +44,10 @@ import {
 import { findCredentialMatch, isCredentialItem, maskCredential, matchesRedactPattern, normalizeScope, upsertMemory, validateKeyPrefix } from './write-gate.js'
 import { parseImportEntries } from './import.js'
 import { createStore, withConflictRetry, type StoreFileHandle, type StoreFs } from './store.js'
+import { PLUGIN_NAME } from './const.js'
+import type { ExtractCounters, MemoryDeps } from './deps.js'
 
-export const name = '@dsh-external/dsh-persistent-memory'
+export const name = PLUGIN_NAME
 export const inject = ['tools', 'commands', 'settings']
 
 
@@ -679,11 +681,75 @@ export function apply(ctx: Context, config: Config): void {
   // M5：并发粒度——per-session 互斥 + 全局上限（修复前是全局单例布尔：两个会话同时
   // 结束回合时后到者被静默丢弃，而它已经写过 lastExtractAt，整个冷却周期不再尝试）
   const extractingSessions = new Set<string>()
-  let globalExtractInFlight = 0
+  // 第 2 批拆分：装箱成对象字段，deps 传递的是同一引用（解构成 number 会让并发上限失效）
+  const extractCounters: ExtractCounters = { globalInFlight: 0 }
   const MAX_CONCURRENT_EXTRACT = 2
 
   /** M4：提炼库容量软上限——超过后提取器只接受高价值或可合并候选 */
   const EXTRACT_LIBRARY_SOFT_CAP = 500
+
+  // ── 显式依赖对象（第 2 批拆分）────────────────────────────────────────
+  // 拆分前所有函数都闭包在 apply() 作用域上；现在把「共享状态 + 归一化配置常量 +
+  // 辅助函数」打包成同一实例，沿 registerXxx(ctx, deps) 传递。
+  // 禁止 { ...deps } 展开或重建：sessionInjections 分叉 → 注入去重失效；
+  // extractCounters 分叉 → 提取并发上限失效（M5）；runtime 分叉 → 面板开关失效（B1）。
+  const deps: MemoryDeps = {
+    // 配置面
+    dataDir,
+    dataFile,
+    defaultScope,
+    maxResults,
+    autoRecall,
+    autoRecallLimit,
+    autoRecallMaxChars,
+    autoRecallBudgetChars,
+    injectionBudgetChars,
+    autoRecallMinScore,
+    autoRecallRelativeFloor,
+    autoRecallScope,
+    autoRecallFallback,
+    autoCapture,
+    autoExtract,
+    autoExtractCooldownMs,
+    autoRecallOnce,
+    autoRecallCooldownMs,
+    rrfRecall,
+    rrfFirstTurnOnly,
+    approveOnSet,
+    synonymExpansion,
+    dedupeOnSet,
+    autoRecallRerank,
+    taskTtlDays,
+    autoRecallRerankMax,
+    valueMaxChars,
+    fullMaxChars,
+    allowCredentialReveal,
+    redactPatterns,
+    maxItems,
+    // 运行时开关（面板写、消费点读）
+    runtime,
+    // store 面
+    store,
+    readItems,
+    writeItems,
+    withLock,
+    searchItems,
+    // 会话状态
+    sessionInjections,
+    persistInjectionState,
+    turnBuffers,
+    lastExtractAt,
+    lastManualWriteAt,
+    extractingSessions,
+    extractCounters,
+    // 工具函数
+    makeId,
+    normalizeTags,
+    setBounded,
+    isSubagentAgent,
+    currentWorkspaceScopes,
+    shouldMaskOutbound,
+  }
 
   /** 提取器落盘路径：与 memory_set 同源的最小闸门（前缀白名单/凭据词/value 截断/tags 裁剪）。
    *  P1-2（复审收口）：返回值从 boolean 改成归宿枚举——原先所有拒绝都只 return false，
@@ -860,7 +926,7 @@ export function apply(ctx: Context, config: Config): void {
         const sid = String(agent.session?.id ?? '')
         if (!sid) return
         if (extractingSessions.has(sid)) return                  // 同会话不重入
-        if (globalExtractInFlight >= MAX_CONCURRENT_EXTRACT) return  // 超全局上限：本次放弃，且不写冷却（下轮可重试）
+        if (extractCounters.globalInFlight >= MAX_CONCURRENT_EXTRACT) return  // 超全局上限：本次放弃，且不写冷却（下轮可重试）
         const now = Date.now()
         const last = lastExtractAt.get(sid)
         if (last !== undefined && now - last < autoExtractCooldownMs) return
@@ -871,13 +937,13 @@ export function apply(ctx: Context, config: Config): void {
         // 冷却与占位在「真正发起请求」之后才写：修复前先写 lastExtractAt 再 return，
         // 被上限/互斥跳过的会话会白等一个冷却周期
         extractingSessions.add(sid)
-        globalExtractInFlight += 1
+        extractCounters.globalInFlight += 1
         setBounded(lastExtractAt, sid, now)
         void extractAndWrite(sid, buf.join('\n').slice(-4000))
           .catch((err) => ctx.logger.warn('[mem] extract failed: %o', err))
           .finally(() => {
             extractingSessions.delete(sid)
-            globalExtractInFlight -= 1
+            extractCounters.globalInFlight -= 1
           })
       } catch { /* 观察者绝不抛 */ }
     }, { global: true })
