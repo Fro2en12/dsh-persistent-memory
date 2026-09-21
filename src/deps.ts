@@ -100,4 +100,7 @@ export interface MemoryDeps {
   isSubagentAgent: (agent: any) => boolean
   currentWorkspaceScopes: () => string[]
   shouldMaskOutbound: (key: string, value: string) => boolean
+
+  /** 导入根目录白名单：原 config.importAllowRoots。用 getter 保持「调用时求值」的时机不变 */
+  importAllowRoots: () => string[] | undefined
 }
