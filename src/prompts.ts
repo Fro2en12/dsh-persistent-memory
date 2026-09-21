@@ -1,6 +1,9 @@
 // 注入提示词与判据文本：从 index.ts 拆出（纯文本 + 一处 valueMaxChars 插值），便于单独审阅与改口径。
 // 与代码里的硬闸门同源：前缀清单来自 types.ts 的 KEY_PREFIX_LIST，value 上限来自 config.valueMaxChars。
-import { KEY_PREFIX_LIST } from './types.js'
+import { KEY_PREFIX_LIST, KEY_PREFIX_WHITELIST } from './types.js'
+
+/** 提取器允许的前缀：auth 会被 writeExtractedMemory 直接拒绝，不能写进判据里让模型白吐候选。 */
+const EXTRACT_PREFIX_LIST = KEY_PREFIX_WHITELIST.filter((p) => p !== 'auth').join('/')
 
 /** 完整记忆守则（第六轮起唯一版本：brief 版已删除）。说明见下方设计注释。 */
 export function buildAutoCaptureText(valueMaxChars: number): string {
@@ -102,7 +105,7 @@ export const EXTRACTION_SYSTEM_PROMPT = [
   '判断要点：① 换个会话还成立吗；② 从当前代码/文件/git 看得出来吗（看得出来就不记）；③ 未来真会再用到吗。①与③必须成立，②是排除项。',
   '失败与成功都要记——本轮出现了明确的坑、纠正或结论时就应当提取，不要因为「拿不准」而一律返回空。',
   '不提取：临时进度、完整修复步骤、可推导内容、流水账（PR 列表/活动摘要）、代码里已有的架构与路径。口令、令牌、密钥一律不提取。',
-  `key 前缀限 ${KEY_PREFIX_LIST}；rule.*/lesson.* 的 value 用「一行规则 + Why: + How to apply:」结构；task.* 写绝对日期；value 保留具体名词（文件名/命令/报错词），不用代词。`,
+  `key 前缀限 ${EXTRACT_PREFIX_LIST}（不含 auth：凭据一律不提取）；rule.*/lesson.* 的 value 用「一行规则 + Why: + How to apply:」结构；task.* 写绝对日期；value 保留具体名词（文件名/命令/报错词），不用代词。`,
   '最多 3 条。只输出 JSON：{"memories":[{"key":"前缀.名","value":"自足摘要","tags":["标签"]}]}',
 ].join('\n')
 

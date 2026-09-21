@@ -771,3 +771,30 @@ describe('复审修复：可见面与清洗的一致性', () => {
     expect(text, '天龄必须出现在结果行里').toMatch(/今天|昨天|\d+ 天前/)
   })
 })
+
+// ── 复审 P1：长记忆的空操作防护 / 提取器容量拒绝的可见性 ──────────────────────
+describe('复审 P1 修复', () => {
+  it('P1-1 长记忆（value > valueMaxChars）重复写同一内容 → 空操作，且不丢上一次的显式 full', async () => {
+    const { fake, dir } = setup()
+    const set = fake.toolDefs.get('memory_set')
+    const long = '长'.repeat(270)   // > valueMaxChars(240) ⇒ 走截断归档分支
+    const w1 = await set.execute({ key: 'rule.longnoop', value: long, full: 'EXPLICIT-ORIGINAL-TEXT' }, MAIN)
+    expect(w1.changed).toBe(true)
+    const first = readFileSync(join(dir, 'memory.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)).find((x: any) => x.key === 'rule.longnoop')
+    expect(first.full, '显式 full 应被保留').toContain('EXPLICIT-ORIGINAL-TEXT')
+    const w2 = await set.execute({ key: 'rule.longnoop', value: long }, MAIN)
+    expect(w2.changed, 'P1-1：同一长内容重申必须判为空操作').toBe(false)
+    expect(w2.updatedAt, '空操作不刷新 updatedAt').toBe(w1.updatedAt)
+    const after = readFileSync(join(dir, 'memory.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)).find((x: any) => x.key === 'rule.longnoop')
+    expect(after.full, '上一次归档的正文不得被静默丢弃').toContain('EXPLICIT-ORIGINAL-TEXT')
+  })
+
+  it('P1-1 对照组：换了内容的长记忆仍判为变化（证明不是一律空操作）', async () => {
+    const { fake } = setup()
+    const set = fake.toolDefs.get('memory_set')
+    const w1 = await set.execute({ key: 'rule.longchg', value: '甲'.repeat(270) }, MAIN)
+    const w2 = await set.execute({ key: 'rule.longchg', value: '乙'.repeat(270) }, MAIN)
+    expect(w1.changed).toBe(true)
+    expect(w2.changed).toBe(true)
+  })
+})

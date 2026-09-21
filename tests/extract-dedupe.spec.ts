@@ -224,7 +224,8 @@ describe('F6 提取器容量守卫', () => {
     await waitFile(dir, (raw) => raw.includes('env.other'))
     // 完成锚：extractAndWrite 只在遍历完所有候选之后才打这条日志
     // （src/index.ts:990）→ ②已被裁决过，后续对 .bak 的检查不再是「抢跑」。
-    expect(await waitLog(fake, '[mem] extract wrote'), '提取器应当跑完并记账').toBe(true)
+    // P1-2 起摘要行改口径为「N written, M skipped」；锚点同步（原为 '[mem] extract wrote'）
+  expect(await waitLog(fake, '[mem] extract:'), '提取器应当跑完并记账').toBe(true)
     const items = parseItems(dir)
     const kept = items.find((x: any) => x.key === 'env.node-version')
     expect(kept.updatedAt, '内容全等 → updatedAt 不应被刷新').toBe(NOW)
@@ -284,5 +285,27 @@ describe('F12 空操作不压制轮末提取器', () => {
     await waitFile(dir, (raw) => raw.includes('env.other'))
     expect(parseItems(dir).some((x: any) => x.key === 'env.other'), '空操作不应压制提取器').toBe(true)
     expect(readFileSync(join(dir, 'memory.jsonl'), 'utf8'), '空操作不应压制提取器').toContain('env.other')
+  })
+})
+
+// ── 复审 P1-2：容量拒绝必须可见，且不得报成纯成功 ────────────────────────────
+describe('复审 P1-2 提取器容量拒绝的可见性', () => {
+  it('库达 maxItems 时：摘要行报出被丢弃数，且不得只报成功', async () => {
+    const now = '2026-09-17T00:00:00.000Z'
+    const seed = Array.from({ length: 5 }, (_, i) => ({ id: 'i' + i, key: 'task.item-' + i, value: '历史条目 ' + i, scope: 'global', tags: [], createdAt: now, updatedAt: now }))
+    const dir = makeTempDir()
+    tmpDirs.push(dir)
+    writeFileSync(join(dir, 'memory.jsonl'), seed.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf8')
+    const fake = makeFakeCtx({}, {
+      llm: { stream: async function* () { yield { type: 'text-delta', text: JSON.stringify({ memories: [{ key: 'rule.cannot-add', value: '全新高价值教训', tags: [] }] }) } } },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    })
+    apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: true, autoExtractCooldownMs: 30000, maxItems: 5 })
+    feedTurn(fake, 'sess-p12', '记住这个')
+    expect(await waitLog(fake, '[mem] extract:'), '提取器跑完必须留下一条摘要（原先库满时连一条日志都没有）').toBe(true)
+    const text = fake.logs.map((l: any) => l.level + ' ' + l.message).join('\n')
+    expect(text, '库满与丢弃数必须出现在日志里').toMatch(/maxItems=5/)
+    expect(text, '不得把被丢弃的候选报成纯成功').toMatch(/dropped/)
+    expect(readFileSync(join(dir, 'memory.jsonl'), 'utf8'), '超限候选不得落盘').not.toContain('cannot-add')
   })
 })

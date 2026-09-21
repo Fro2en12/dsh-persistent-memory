@@ -686,20 +686,23 @@ export function apply(ctx: Context, config: Config): void {
   const EXTRACT_LIBRARY_SOFT_CAP = 500
 
   /** 提取器落盘路径：与 memory_set 同源的最小闸门（前缀白名单/凭据词/value 截断/tags 裁剪）。
-   *  @returns 是否真的写入（被闸门拦截返回 false，调用方继续尝试下一条候选）。 */
-  async function writeExtractedMemory(raw: { key?: unknown; value?: unknown; tags?: unknown[] }): Promise<boolean> {
+   *  P1-2（复审收口）：返回值从 boolean 改成归宿枚举——原先所有拒绝都只 return false，
+   *  调用方无法区分「闸门拒绝」「软上限拒绝」「库满拒绝」「内容全等」，于是容量丢弃被静默吞掉、
+   *  日志还把这一轮报成成功。
+   *  @returns written 真写入｜noop 内容全等未落盘｜rejected 闸门/软上限拒绝｜capacity 库达 maxItems */
+  async function writeExtractedMemory(raw: { key?: unknown; value?: unknown; tags?: unknown[] }): Promise<'written' | 'noop' | 'rejected' | 'capacity'> {
     const key = String(raw.key ?? '').trim()
-    if (!key) return false
+    if (!key) return 'rejected'
     const prefix = key.split('.')[0].toLowerCase()
-    if (!KEY_PREFIX_WHITELIST.includes(prefix)) return false
-    if (prefix === 'auth') return false
+    if (!KEY_PREFIX_WHITELIST.includes(prefix)) return 'rejected'
+    if (prefix === 'auth') return 'rejected'
     let value = String(raw.value ?? '').trim()
-    if (!value) return false
-    if (findCredentialMatch(value)) return false
+    if (!value) return 'rejected'
+    if (findCredentialMatch(value)) return 'rejected'
     if (value.length > valueMaxChars) value = truncate(value, valueMaxChars)
     const tags = Array.isArray(raw.tags) ? raw.tags.map((t) => String(t)).filter(Boolean).slice(0, 3) : []
     const now = new Date().toISOString()
-    let written = false
+    let outcome: 'written' | 'noop' | 'rejected' | 'capacity' = 'noop'
     await withLock(() => withConflictRetry(async () => {
       const items = await readItems()
       // M4 容量软上限：无人值守的提取器不能无限撑大库（scoreItem 与全量重写随条数线性劣化）。
@@ -708,7 +711,7 @@ export function apply(ctx: Context, config: Config): void {
         const mergeable = items.some((item) => item.scope === defaultScope
           && (keySimilarity(item.key, key) >= 0.6 || bigramJaccard(item.value, value) >= 0.6))
         if (!mergeable) {
-          written = false
+          outcome = 'rejected'
           return
         }
       }
@@ -731,15 +734,15 @@ export function apply(ctx: Context, config: Config): void {
       // 可穿透软上限，无人值守路径能把库推到硬上限之上。
       if (result.created && items.length > maxItems) {
         items.pop()
-        written = false
+        outcome = 'capacity'
         return
       }
       // T17：内容全等（含 dedupe 合并到等价条目）时不落盘——省掉抢锁与写盘；
-      // 此时也不计入 written，调用方会继续尝试下一条候选。
+      // 此时记为 noop，调用方会继续尝试下一条候选。
       if (result.changed) await writeItems(items)
-      written = result.changed
+      outcome = result.changed ? 'written' : 'noop'
     }))
-    return written
+    return outcome
   }
 
 
@@ -787,17 +790,35 @@ export function apply(ctx: Context, config: Config): void {
     try { parsed = JSON.parse(m[0]) } catch { return }
     const memories = Array.isArray(parsed?.memories) ? parsed.memories : []
     let written = 0
+    // 上限由 slice(0, 3) 决定；原先这里还有一句 if (written >= 3) break —— 每轮至多 +1 且候选 ≤3，
+    // 永远到不了 3，是死代码，且会让人误以为上限由它把守（R4 复审 F-B）。
+    let skipped = 0
+    let droppedByCapacity = 0
     for (const cand of memories.slice(0, 3)) {
-      if (written >= 3) break
       try {
-        if (await writeExtractedMemory(cand)) written += 1
+        const outcome = await writeExtractedMemory(cand)
+        if (outcome === 'written') written += 1
+        else {
+          skipped += 1
+          if (outcome === 'capacity') droppedByCapacity += 1
+        }
       } catch (err) {
-        // 闸门拒绝走的是 writeExtractedMemory 的 return false，不抛错；能到这里的是
+        skipped += 1
+        // 闸门拒绝走的是 writeExtractedMemory 的 return 'rejected'，不抛错；能到这里的是
         // withLock/withConflictRetry/writeItems 的存储层异常，别把两者混为一谈。
         ctx.logger.warn('[mem] extract write failed (存储层异常，非闸门拒绝): %o', err)
       }
     }
-    if (written > 0) ctx.logger.info('[mem] extract wrote %d item(s)', written)
+    // P1-2（复审收口）：库满是用户可操作的条件，此前完全静默、还被报成成功。
+    // 默认日志阈值是 INFO（warn 不可见，见上方级别说明），故给两条：warn 表达语义级别，
+    // info 摘要兜住默认部署下的可见性。
+    if (droppedByCapacity > 0) {
+      ctx.logger.warn('[mem] extract: library at maxItems=%d, %d candidate(s) dropped — run memory_dream', maxItems, droppedByCapacity)
+    }
+    if (written > 0 || skipped > 0) {
+      ctx.logger.info('[mem] extract: %d written, %d skipped%s', written, skipped,
+        droppedByCapacity > 0 ? ` (${droppedByCapacity} dropped: library at maxItems=${maxItems}; run memory_dream)` : '')
+    }
   }
 
   if (autoExtract) {
@@ -1138,14 +1159,15 @@ export function apply(ctx: Context, config: Config): void {
     let full = input.full !== undefined ? (String(input.full).trim() || undefined) : undefined
     const warnings: string[] = []
     const nowStamp = new Date().toISOString()
-    if (value.length > valueMaxChars) {
-      const rawValue = value
-      value = truncate(value, valueMaxChars)
-      // m9：最新一次原文置顶（带时间戳标记），旧内容保留在尾部但整体受 fullMaxChars 约束——
-      // 修复前是尾部追加，full 会随更新次数单调膨胀
-      const stamped = `<!-- ${nowStamp} -->\n${rawValue}`
-      full = full ? `${stamped}\n\n${full}`.slice(0, fullMaxChars) : stamped.slice(0, fullMaxChars)
-      warnings.push(`value 摘要 ${rawValue.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
+    // P1-1（复审收口）：超长 value 的「置顶归档」决策必须推迟到锁内读到 prev 之后。
+    // 修复前在这里无条件执行 full = stamped(rawValue, nowStamp)：nowStamp 每次调用都是新的，
+    // 于是 prev.full !== nextFull 恒成立 ⇒ T17 空操作防护在 value > valueMaxChars 的条目上
+    // 永不触发（updatedAt 被反复刷新、每次重申整库重写），且未显式传 full 时会用新戳覆盖掉
+    // 上一次归档的正文。此处只记录「本次被截断的原文」，赋值见锁内。
+    const overLongRaw = value.length > valueMaxChars ? value : undefined
+    if (overLongRaw !== undefined) {
+      value = truncate(overLongRaw, valueMaxChars)
+      warnings.push(`value 摘要 ${overLongRaw.length} 字超过 ${valueMaxChars} 字上限，已截断为摘要（结尾 …），完整原文已归档到 full（memory_get includeFull 可取回）`)
     }
     if (full !== undefined && full.length > fullMaxChars) {
       full = full.slice(0, fullMaxChars)
@@ -1174,11 +1196,22 @@ export function apply(ctx: Context, config: Config): void {
     const source = (input.source || '').trim() || `${now.slice(0, 10)}${sessionId ? ` s=${sessionId.slice(0, 8)}` : ''}`
     const outcome = await withLock(() => withConflictRetry(async () => {
       const items = await readItems()
+      // P1-1：只有在这里才拿得到 prev.full —— 据此决定 full 是「原样保留」还是「置顶新原文」。
+      let fullForWrite = full
+      if (overLongRaw !== undefined) {
+        const prevItem = items.find((item) => item.scope === scope && item.key === key)
+        const stamped = `<!-- ${nowStamp} -->\n${overLongRaw}`
+        // m9 的意图是「最新原文置顶、历史内容保留在尾部」，受 fullMaxChars 约束（修复前尾部追加会单调膨胀）。
+        // 旧 full 里已经有这次原文 ⇒ 同一内容被重申，原样保留：这正是空操作判定能成立的前提。
+        if (full !== undefined) fullForWrite = `${stamped}\n\n${full}`.slice(0, fullMaxChars)
+        else if (prevItem?.full?.includes(overLongRaw)) fullForWrite = prevItem.full
+        else fullForWrite = (prevItem?.full ? `${stamped}\n\n${prevItem.full}` : stamped).slice(0, fullMaxChars)
+      }
       // ④ 去重合并 / 冲突检测 / push 新建：逻辑见 write-gate.ts 的 upsertMemory
       const result = upsertMemory(items, {
         key,
         value,
-        full,
+        full: fullForWrite,
         links,
         tags,
         scope,
