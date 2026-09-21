@@ -22,7 +22,7 @@ import type { MemoryDeps } from './deps.js'
 
 export function registerCommands(ctx: Context, deps: MemoryDeps, writeOps: WriteOps): void {
   const {
-    dataDir, dataFile, defaultScope, approveOnSet,
+    dataDir, dataFile, defaultScope,
     fullMaxChars, store, readItems, writeItems,
     withLock, searchItems, makeId,
   } = deps

@@ -25,7 +25,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
     autoRecall, autoRecallLimit, autoRecallMaxChars, autoRecallBudgetChars,
     injectionBudgetChars, autoRecallMinScore, autoRecallRelativeFloor, autoRecallScope,
     autoRecallFallback, autoCapture, autoRecallOnce, autoRecallCooldownMs,
-    rrfRecall, rrfFirstTurnOnly, synonymExpansion, autoRecallRerank,
+    rrfRecall, rrfFirstTurnOnly, synonymExpansion,
     taskTtlDays, autoRecallRerankMax, valueMaxChars, runtime,
     readItems, withLock, sessionInjections, persistInjectionState,
     makeId, setBounded, isSubagentAgent, currentWorkspaceScopes,
@@ -261,7 +261,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
               // LLM 语义重排（v0.1.6）：词法命中候选 ≥1 且启用时，用 LLM 挑"明确有用"的条
               let recalledItems = recalled
               if (runtime.autoRecallRerank && query && !hasImage && recalled.length > 0) {
-                const pool = pickRecallCandidates(items, query, autoRecallRerankMax * 4, scoreEnv())
+                const pool = pickRecallCandidates(items, query, autoRecallRerankMax * 4, scoreEnv)
                 if (pool.length >= 1) {
                   const picked = await rerankMemories(ctx, query, pool, autoRecallRerankMax, payload.signal)
                   if (picked) recalledItems = picked   // 空数组也是有效结果 → 回落索引兜底

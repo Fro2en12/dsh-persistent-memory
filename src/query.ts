@@ -3,7 +3,9 @@
  *
  * 这些函数原本闭包在 apply() 作用域上，实测只有 pickRecallCandidates 真的读闭包状态
  * （scoreEnv()），其余都是纯函数。故：纯函数原样搬出；pickRecallCandidates 参数化——
- * 新增 env: ScoreEnv 形参，调用点传 scoreEnv()（与拆分前调用的同一个函数）。
+ * 新增 env: () => ScoreEnv 形参，函数内保持 rrfRanking(items, query, env()) 的调用形态，
+ * 调用点传 scoreEnv 本身（不预先求值）：env() 的求值点与拆分前 rrfRanking(..., scoreEnv())
+ * 的参数求值位置逐字对应（红队 P2 收口）。
  */
 import { lexicalHit, rrfRanking, semanticOverlap, type ScoreEnv } from './recall.js'
 import type { MemoryItem } from './types.js'
@@ -87,8 +89,8 @@ export function pickLessonItems(items: MemoryItem[], query: string, isRegret: bo
 }
 
 // 重排候选池（v0.1.9）：RRF 双排名取 top max——词法零命中但语义相关的条目也能进 LLM 重排视野
-export function pickRecallCandidates(items: MemoryItem[], query: string, max: number, env: ScoreEnv): MemoryItem[] {
+export function pickRecallCandidates(items: MemoryItem[], query: string, max: number, env: () => ScoreEnv): MemoryItem[] {
   if (!query) return []
-  const ranked = rrfRanking(items, query, env).filter((e) => e.rrf >= 0.025)
+  const ranked = rrfRanking(items, query, env()).filter((e) => e.rrf >= 0.025)
   return ranked.slice(0, max).map((e) => e.item)
 }

@@ -20,7 +20,7 @@ import { ARCHIVE_SUMMARY_MAX, isCompletedMark, type WriteOps } from './write-ops
 
 export function registerTools(ctx: Context, deps: MemoryDeps, writeOps: WriteOps): void {
   const {
-    defaultScope, approveOnSet, valueMaxChars, fullMaxChars,
+    defaultScope, valueMaxChars, fullMaxChars,
     allowCredentialReveal, maxItems, store, readItems,
     writeItems, withLock, searchItems, isSubagentAgent,
     currentWorkspaceScopes, shouldMaskOutbound,

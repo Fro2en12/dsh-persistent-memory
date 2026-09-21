@@ -32,6 +32,7 @@ export interface RuntimeSwitches {
   autoRecallRerank: boolean
   rrfRecall: boolean
   rrfFirstTurnOnly: boolean
+  /** 审批门。注意：这是 apply 期快照，**消费点是 runtime.approveOnSet**（面板可改）；不要在模块里直接读它 */
   approveOnSet: boolean
 }
 
