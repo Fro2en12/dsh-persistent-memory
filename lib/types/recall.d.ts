@@ -43,5 +43,21 @@ export declare function fitBudget(items: MemoryItem[], budget: number, maxChars:
     kept: MemoryItem[];
     used: number;
 };
+/**
+ * 按「渲染后真实长度」收敛（M11 收口；第七轮从 pre-step 的两处重复循环抽成纯函数，便于单测）。
+ *
+ * fitBudget 的 cost 是条目估算（value + key + 64），不含通道标题、行前缀与「🔗 关联」等包装——
+ * 实测每通道低估 17–22 字。直接按估算扣减，后续通道会据虚高的剩余额度误判（索引块挤进真实
+ * 已经不足的余额）。这里从尾部（分数最低的项）逐个丢弃，直到渲染长度落进 budget。
+ *
+ * @param items 已按分数排序的候选
+ * @param budget 本通道可用字符数
+ * @param render 把 kept 渲染成最终注入文本的纯函数
+ * @returns kept 与它的渲染结果；两者始终一致，调用方直接用 text.length 扣减预算
+ */
+export declare function fitByRenderedLength<T>(items: T[], budget: number, render: (items: T[]) => string): {
+    kept: T[];
+    text: string;
+};
 export declare function truncate(text: string, max: number): string;
 export declare function ageLabel(iso: string): string;

@@ -29,6 +29,7 @@ import {
   bigramJaccard,
   contentSimilarity,
   fitBudget,
+  fitByRenderedLength,
   keySimilarity,
   lexicalHit,
   pickRecallItems,
@@ -719,7 +720,7 @@ export function apply(ctx: Context, config: Config): void {
     '没有信号就不查；查不到不是失败，硬用不相关的记忆才是。',
     '',
     '## 什么时候写',
-    '三个信号出现就写：① 用户明确说「记住」；② 用户纠正你，或确认了某个非常规做法——「对，就这样」与「别这样」同样重要，只记纠正会让你越来越保守；③ 用户分享了应该跨会话留存的背景（角色、目标、项目决策、外部资源位置）。',
+    '三个信号出现就用 `memory_set` 写下来：① 用户明确说「记住」；② 用户纠正你，或确认了某个非常规做法——「对，就这样」与「别这样」同样重要，只记纠正会让你越来越保守；③ 用户分享了应该跨会话留存的背景（角色、目标、项目决策、外部资源位置）。',
     '其余情况默认不写；只有三条同时满足才写：跨会话仍然成立、代码与文档里看不出来、未来会再次用到。',
     '**本轮结论由你写**——你是记录的主力。后台提取器只是兜底（判据严格、常返回空），不要指望它替你记；你在本轮写过，它当轮就会跳过。',
     '被要求记流水账（PR 列表、活动摘要、整段会议记录）时：先追问「哪一点最意外或最不显然」，只记那一条，不照抄全文。',
@@ -772,7 +773,8 @@ export function apply(ctx: Context, config: Config): void {
   //   恒为默认值，full 等于死代码，且两套文案要各自同步口径（本轮就因口径不同步返工过一次）。
   // · 上一版 brief 曾砍掉「什么时候写」的触发信号，实测 18 条记忆里仅 2 条来自自动提取；
   //   精简的取舍线应是「触发与责任常驻，格式与示例可外移」，而不是砍触发。
-  // · 成本实测可接受：完整守则 3049 字 ≈ 2350 token/会话，占 system prompt 两成上下。
+  // · 成本实测可接受：完整守则 3066 字 ≈ 2363 token/会话，占 system prompt 两成上下
+  //   （无 sessionQuery 形态实测 3066；有 sessionQuery 时 +46 = 3112）。
   // · 写入格式（value 上限、tags 数、scope 归属、相似 key 预查）仍在文本内；闸门另有逐条报错兜底。
   // 配套改动：守则不再计入 injectionBudgetChars（见 pre-step ①）。
 
@@ -886,20 +888,30 @@ export function apply(ctx: Context, config: Config): void {
       }
       // M4：复用 memory_set 的合并逻辑——修复前只按精确 key 匹配，同一事实的 key 漂移
       // （env.node-version / env.nodejs-version / tool.node-version）每次都新建一条。
-      upsertMemory(items, {
+      const result = upsertMemory(items, {
         key,
         value,
         full: undefined,
-        links: [],
-        tags,
+        links: undefined,   // F7：提取不覆盖已有 links
+        tags: tags.length ? tags : undefined,   // 候选没给 tags 时保持旧值
         scope: defaultScope,
         createdAt: now,
         updatedAt: now,
         source: '轮末提取',
         explicitSource: true,
       }, { dedupe: true, makeId })
-      await writeItems(items)
-      written = true
+      // M12 容量守卫（第七轮补）：与 memory_set:1365 同口径——只挡「新增」，更新已有 key 不受限。
+      // 修复前提取器完全不看 maxItems，只受 EXTRACT_LIBRARY_SOFT_CAP 软上限约束，且 rule/lesson
+      // 可穿透软上限，无人值守路径能把库推到硬上限之上。
+      if (result.created && items.length > maxItems) {
+        items.pop()
+        written = false
+        return
+      }
+      // T17：内容全等（含 dedupe 合并到等价条目）时不落盘——省掉抢锁与写盘；
+      // 此时也不计入 written，调用方会继续尝试下一条候选。
+      if (result.changed) await writeItems(items)
+      written = result.changed
     }))
     return written
   }
@@ -922,6 +934,11 @@ export function apply(ctx: Context, config: Config): void {
     '最多 3 条。只输出 JSON：{"memories":[{"key":"前缀.名","value":"自足摘要","tags":["标签"]}]}',
   ].join('\n')
 
+  // 日志级别说明：cordis 的默认阈值是 INFO（vendor/cordis/src/logger.ts:155-156 的
+  // targetLevel ?? LoggerLevel.INFO），warn 与 debug 都被丢弃；默认部署也没有挂
+  // logger-console（它的 getDefaults 不设 levels），所以下面的 warn 在默认环境下不可见。
+  // 级别仍按官方惯例取 warn——官方对可预期的后台失败一律 warn（session-title/src/index.ts:570、
+  // session-persistence-jsonl/src/storage.ts:536）。要看它需挂 logger-console 且 levels.default ≥ 2。
   async function extractAndWrite(sid: string, dialogue: string): Promise<void> {
     const llm = ctx.get('llm') as any
     if (!llm) return
@@ -965,7 +982,9 @@ export function apply(ctx: Context, config: Config): void {
       try {
         if (await writeExtractedMemory(cand)) written += 1
       } catch (err) {
-        ctx.logger.warn('[mem] extract write failed (候选被写侧闸门拒绝): %o', err)
+        // 闸门拒绝走的是 writeExtractedMemory 的 return false，不抛错；能到这里的是
+        // withLock/withConflictRetry/writeItems 的存储层异常，别把两者混为一谈。
+        ctx.logger.warn('[mem] extract write failed (存储层异常，非闸门拒绝): %o', err)
       }
     }
     if (written > 0) ctx.logger.info('[mem] extract wrote %d item(s)', written)
@@ -1114,19 +1133,16 @@ export function apply(ctx: Context, config: Config): void {
               return !entered.some((m) => JSON.stringify(m).includes(marker))
             })
             const lessonAvail = Math.max(0, Math.min(autoRecallBudgetChars, remainingBudget))
-            let lessonKept = fitBudget(fresh, lessonAvail, autoRecallMaxChars, sanitizeValue, { atLeastOne: false }).kept
-            let lessonText = formatLesson(lessonKept)
-            // M11 收口（第六轮）：fitBudget 的 used 是条目估算（value+key+64），不含通道标题、
-            // 行前缀与附注等包装——实测教训通道估算 132 而实际渲染 192，低估 60 字。若沿用
-            // 估算扣减，后续通道会据虚高的剩余额度误判（索引 91 字挤进真实只剩 43 的余额）。
-            // 按渲染后的真实长度回退到可用额度内，再用真实长度扣减。
-            while (lessonKept.length > 0 && lessonText.length > lessonAvail) {
-              lessonKept = lessonKept.slice(0, -1)
-              lessonText = formatLesson(lessonKept)
-            }
+            // M11 收口：先按估算取候选，再按渲染后真实长度收敛（包装开销见 fitByRenderedLength 的注释）
+            const lessonFitted = fitByRenderedLength(
+              fitBudget(fresh, lessonAvail, autoRecallMaxChars, sanitizeValue, { atLeastOne: false }).kept,
+              lessonAvail,
+              formatLesson,
+            )
+            const lessonKept = lessonFitted.kept
             if (lessonKept.length > 0) {
-              remainingBudget -= lessonText.length
-              const text = lessonText
+              remainingBudget -= lessonFitted.text.length
+              const text = lessonFitted.text
               entered.splice(lastClaimedIndex + 1 + (changed ? 1 : 0), 0, {
                 role: 'user',
                 id: makeId(),
@@ -1168,14 +1184,14 @@ export function apply(ctx: Context, config: Config): void {
               }
               // M11：召回同样受剩余总预算约束（单通道预算与剩余预算取小）
               const recallAvail = Math.max(0, Math.min(autoRecallBudgetChars, remainingBudget))
-              recalledItems = fitBudget(recalledItems, recallAvail, autoRecallMaxChars, sanitizeValue, { atLeastOne: false }).kept
-              let recallText = formatRecall(recalledItems, items)
-              // M11 收口：同教训通道——估算 used 不含标题与「🔗 关联」行等包装，
-              // 按真实渲染长度回退并扣减，避免击穿会话级总预算。
-              while (recalledItems.length > 0 && recallText.length > recallAvail) {
-                recalledItems = recalledItems.slice(0, -1)
-                recallText = formatRecall(recalledItems, items)
-              }
+              // M11 收口：同教训通道——估算 used 不含标题与「🔗 关联」行等包装
+              const recallFitted = fitByRenderedLength(
+                fitBudget(recalledItems, recallAvail, autoRecallMaxChars, sanitizeValue, { atLeastOne: false }).kept,
+                recallAvail,
+                (xs) => formatRecall(xs, items),
+              )
+              recalledItems = recallFitted.kept
+              const recallText = recallFitted.text
               // recallEmpty 必须在重排与预算裁剪之后定：否则被砍空后既不注内容、也不注索引 = 白屏
               recallEmpty = recalledItems.length === 0
               if (recalledItems.length > 0) {
@@ -1297,8 +1313,10 @@ export function apply(ctx: Context, config: Config): void {
       const subId = String(exec?.agent?.session?.id ?? 'unknown')
       throw new Error(`memory_set: 子代理会话禁止写入 global 记忆；确需落地请用 scope=sub:${subId}，成果建议以结果报告回传父会话由父会话沉淀`)
     }
-    const tags = normalizeTags(input.tags)
-    const links = normalizeTags(input.links)
+    // F7（第七轮）：undefined = 不改动，[] = 清空。必须在 normalizeTags 之前区分——
+    // normalizeTags 对非数组一律返回 []，会把「没传」吞成「清空」。
+    const tags = input.tags === undefined ? undefined : normalizeTags(input.tags)
+    const links = input.links === undefined ? undefined : normalizeTags(input.links)
     // ── value 摘要（v0.1.15 宽容写入）─────────────────────────────────
     // 超限不拒绝：句边界截断为摘要（末尾 … 表截断），完整原文归档进 full —— 写失败=丢信息，比超长更糟。
     let value = String(input.value || '').trim()
@@ -1321,8 +1339,8 @@ export function apply(ctx: Context, config: Config): void {
     // ── 写侧闸门（v0.1.7）：实测闸门；文案与守则同源（KEY_PREFIX_LIST 见 types.ts / write-gate.ts）──
     validateKeyPrefix(key, scope)
     const prefix = key.split('.')[0]
-    if (tags.length > 3) {
-      throw new Error(`memory_set: tags 最多 3 个（当前 ${tags.length} 个）。请收敛到最能代表内容的 1-3 个标签。`)
+    if ((tags?.length ?? 0) > 3) {
+      throw new Error(`memory_set: tags 最多 3 个（当前 ${tags?.length ?? 0} 个）。请收敛到最能代表内容的 1-3 个标签。`)
     }
     if (prefix !== 'auth') {
       // M2：凭据正则升级为拒绝（token/secret/api key/bearer/sk-/ghp_/AKIA/PRIVATE KEY/中文口令），
@@ -1370,7 +1388,10 @@ export function apply(ctx: Context, config: Config): void {
       if (result.changed) await writeItems(items)
       return { result, clashWarning }
     }))
-    if (sessionId) setBounded(lastManualWriteAt, sessionId, Date.now())
+    // Claude Code 的 hasMemoryWritesSince 计的是「真的写了一条记忆」：空操作（内容全等、
+    // 未落盘、未刷新 updatedAt）不该算主模型写过——否则反复重申旧记忆会一直压住轮末提取器，
+    // 而实际上什么都没记。与提取侧的 `written = result.changed` 同口径。
+    if (sessionId && outcome.result.changed) setBounded(lastManualWriteAt, sessionId, Date.now())
     const allWarnings = outcome.clashWarning ? [...warnings, outcome.clashWarning] : warnings
     return {
       ok: true,
@@ -1392,9 +1413,9 @@ export function apply(ctx: Context, config: Config): void {
       key: { type: 'string', required: true, description: '记忆键，如 user.name / project.tech' },
       value: { type: 'string', required: true, description: '记忆摘要：召回/搜索只展示它' },
       full: { type: 'string', description: '可选完整正文：memory_get 传 includeFull 才返回，避免 token 膨胀' },
-      links: { type: 'array', items: { type: 'string' }, description: '可选关联记忆 key（同 scope）：召回时展示关联提示' },
+      links: { type: 'array', items: { type: 'string' }, description: '可选关联记忆 key（同 scope）：召回时展示关联提示；不传 = 保留旧值，传空数组 = 清空' },
       scope: { type: 'string', description: '作用域，默认 global；可按项目/工作区隔离' },
-      tags: { type: 'array', items: { type: 'string' }, description: '可选标签' },
+      tags: { type: 'array', items: { type: 'string' }, description: '可选标签（最多 3 个）；不传 = 保留旧值，传空数组 = 清空' },
       confirmed: { type: 'boolean', description: '审批门：approveOnSet 开启时须为 true（先向用户确认过）' },
       source: { type: 'string', description: '可选来源引证（默认自动填 日期+会话）' },
     },
@@ -1414,12 +1435,17 @@ export function apply(ctx: Context, config: Config): void {
         },
       },
       render: (_args, value) => {
-        // T17：区分「写入 / 更新 / 空操作确认」——内容一字未改时报「已更新」会误导模型
+        // T17：区分「写入 / 更新 / 合并更新 / 空操作确认」——内容一字未改时报「已更新」会误导模型。
+        // 空操作必须最先判：dedupe 合并到一条内容全等的旧条目时 mergedKey 非空，若先判 mergedKey
+        // 就会报出「已合并更新」，而实际上 items 未改动、未落盘、updatedAt 还是旧值。
         let action: string
-        if (value.mergedKey) action = `记忆已合并更新：${value.scope}/${value.mergedKey}（与新 key "${value.key}" 高度相似，未新建条目）`
+        if (!value.changed && !value.created) {
+          action = value.mergedKey
+            ? `记忆已确认：与 ${value.scope}/${value.mergedKey} 内容一致（未新建、未刷新更新时间）`
+            : `记忆已确认：${value.scope}/${value.key}（内容与旧值一致，未刷新更新时间）`
+        } else if (value.mergedKey) action = `记忆已合并更新：${value.scope}/${value.mergedKey}（与新 key "${value.key}" 高度相似，未新建条目）`
         else if (value.created) action = `记忆已写入：${value.scope}/${value.key}`
-        else if (value.changed) action = `记忆已更新：${value.scope}/${value.key}`
-        else action = `记忆已确认：${value.scope}/${value.key}（内容与旧值一致，未刷新更新时间）`
+        else action = `记忆已更新：${value.scope}/${value.key}`
         return [{
           type: 'text',
           text: [

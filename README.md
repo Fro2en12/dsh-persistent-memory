@@ -46,7 +46,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 
 | 机制 | 说明 |
 |---|---|
-| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（约 3050 字；第六轮起不再提供精简版，每会话只注入完整守则）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
+| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（约 3070 字；第六轮起不再提供精简版，每会话只注入完整守则）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
 | 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
 | LLM 语义重排 | 候选 ≥1 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
@@ -148,7 +148,7 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
 
 ```
 lib/index.js    Host 半部分（ESM；inject tools/commands/settings，webServer 惰性）
-  ├─ Config（schemastery）      30 个可调参数（含 dataDir/defaultScope 两个部署参数）、加载期校验
+  ├─ Config（schemastery）      31 个可调参数（含 dataDir/defaultScope 两个部署参数）、加载期校验
   ├─ 写侧闸门                   前缀白名单 / ≤240 字 / tags ≤3 / 凭据检测 / 冲突警告
   ├─ pre-step 管线              守则（固定注入、不计预算）→ 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底（后三者共享会话级注入预算 injectionBudgetChars，按此优先级串行分配）
   ├─ RRF 混合召回               bigram-Jaccard 中文二元组 + 词法双排名倒数融合（K=60）
@@ -169,7 +169,7 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 | LLM 重排 | 候选 ≥1 就调用一次，5s 超时+失败降级词法，宁少勿多 |
 | 教训通道 | 悔恨/场景信号强制召回 rule.*/lesson.*，独立 120s 冷却，不受 once 限制 |
 | 索引配额 | global 4 条（user.* 固定 2 席），工作区 scope 各 3 条 |
-| 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「教训+召回+索引」共享；**守则不计入**（每会话固定注入完整版约 3050 字），剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
+| 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「教训+召回+索引」共享；**守则不计入**（每会话固定注入完整版约 3070 字），剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
 | scope 归一 | `normalizeScope` 只做 trim + 小写（M8）；报告建议的「_`/`空格折叠为 `-`」**有意未做**——避免改写用户已有的 scope 命名（如 `my project`），README 与源码注释均记录该决策 |
 | 写侧闸门 | value ≤240 字、tags ≤3、前缀白名单九类 |
 | 写入容量 | `maxItems` 默认 2000：达上限拒绝新增（更新不受限），提示跑 `memory_dream`；`/memory restore` 救援通道不受限 |
@@ -186,6 +186,7 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 - 审批门默认关闭；开启后每次写入需用户确认（`confirmed: true`）；
 - 代谢只列候选，更新/归档/删除由模型执行，不自动删；
 - 会话回捞返回的是历史会话片段，不保证与当前记忆库语义对齐。
+- **插件的 `ctx.logger.warn` 在默认部署下不可见，这不是缺陷**：cordis 导出器的默认阈值是 INFO（DSH 源码 `vendor/cordis/src/logger.ts` 的 `exporter.levels?.default ?? this.level ?? LoggerLevel.INFO`；枚举里 `WARN = 2` 大于 `INFO = 1`，`targetLevel < level` 即丢弃），DSH 默认也不挂 `@deepseek-ai/cordis-plugin-logger-console`（其 `getDefaults()` 同样不设 `levels`，挂了不配仍是 INFO）——所以「轮末提取失败 / 后台写失败」这类 warn 默认看不到。要看它们，需在 profile 里挂 `@deepseek-ai/cordis-plugin-logger-console` 并配置 `levels: { default: 2 }`（WARN）或更高。官方对可预期的后台失败一律用 warn（`packages/session/session-title/src/index.ts` 的自动标题失败分支、`packages/session/session-persistence-jsonl/src/storage.ts` 的后台写失败回调），本插件的级别选择与官方一致。
 
 ## 隐私与数据边界
 

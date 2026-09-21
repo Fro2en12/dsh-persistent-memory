@@ -118,8 +118,10 @@ export interface UpsertInput {
   key: string
   value: string
   full?: string
-  links: string[]
-  tags: string[]
+  /** 关联 key：undefined = 不改动旧值；[] = 清空（F7，第七轮） */
+  links?: string[]
+  /** 标签：undefined = 不改动旧值；[] = 清空（F7，第七轮） */
+  tags?: string[]
   scope: string
   createdAt: string
   updatedAt: string
@@ -170,8 +172,11 @@ export function upsertMemory(items: MemoryItem[], input: UpsertInput, opts: { de
   if (idx >= 0) {
     const prev = items[idx]
     const nextFull = full !== undefined ? full : prev.full
-    const nextLinks = links.length ? links : prev.links
-    const nextTags = tags.length ? tags : prev.tags
+    // F7（第七轮）：undefined = 不改动，[] = 清空。修复前写的是 `links.length ? links : prev.links`，
+    // 「传空数组想清空」被当成「没传」——模型删不掉一个错标的 tag；T17 之后这种写入还会被回以
+    // 「记忆已确认（内容与旧值一致）」，更看不出其实没清掉。
+    const nextLinks = links === undefined ? prev.links : links
+    const nextTags = tags === undefined ? prev.tags : tags
     const nextSource = explicitSource ? source : prev.source
     // T17（第六轮）：空操作防护。updatedAt 被召回排序（recall.ts）、年龄标签与
     // memory_dream 的过期判定（index.ts 的 ageDaysOf 分支）消费；无条件刷新会让反复
@@ -200,7 +205,7 @@ export function upsertMemory(items: MemoryItem[], input: UpsertInput, opts: { de
       clashKey = items[clash.i].key
       clashSim = clash.sim
     }
-    items.push({ id: opts.makeId(), key, value, full, links: links.length ? links : undefined, scope, tags, createdAt, updatedAt, source })
+    items.push({ id: opts.makeId(), key, value, full, links: links?.length ? links : undefined, scope, tags: tags ?? [], createdAt, updatedAt, source })
     created = true
   }
   return { created, mergedKey, changed: true, updatedAt, ...(clashKey !== undefined ? { clashKey, clashSim } : {}) }

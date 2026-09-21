@@ -4,7 +4,7 @@ import { normalizeScope, validateKeyPrefix, findCredentialMatch, upsertMemory } 
 import { sanitizeValue } from '../src/sanitize'
 import { slugKey, parseImportEntries } from '../src/import'
 import {
-  scoreItem, queryTokens, truncate, ageLabel, fitBudget, bigramJaccard, pickRecallItems,
+  scoreItem, queryTokens, truncate, ageLabel, fitBudget, fitByRenderedLength, bigramJaccard, pickRecallItems,
   rrfRanking, semanticOverlap, stripNoise,
 } from '../src/recall'
 import type { MemoryItem } from '../src/types'
@@ -286,5 +286,105 @@ describe('T3-b m5：pickRecallItems 把 isFirstTurn 透传给 rrfRanking', () =>
     // 缺陷态（rrfRanking(scoped, query, env) 恒用 false）会返回 ['a','c']，与下面断言不符。
     expect(pickRecallItems(items, 'alpha beta', 2, false, true, false, RRF_ENV).map((i) => i.id)).toEqual(['a', 'b'])
     expect(pickRecallItems(items, 'alpha beta', 2, false, false, false, RRF_ENV).map((i) => i.id)).toEqual(['a', 'c'])
+  })
+})
+
+// ── F1（第七轮）：渲染长度收敛的纯函数级防护 ───────────────────────────────
+// 缺陷态 A：函数体退化成 `return { kept: items, text: render(items) }`（只按估算取候选、
+//   不做渲染长度回退）——第一条会因 text.length 超预算而变红。
+// 缺陷态 B（H1，红队实测）：超预算就整段丢弃 `if (text.length > budget) return { kept: [], text: render([]) }`。
+//   B 满足旧断言的三条不变量（render([]) = 4 ≤ 60、0 < 3、text === render(kept)），
+//   即「丢光」与「按需从尾部丢」不可区分——故第一条与边界用例都改成了精确条数断言。
+describe('F1 fitByRenderedLength：按渲染长度收敛', () => {
+  const render = (xs: string[]) => '【头】\n' + xs.map((x) => '- ' + x).join('\n')
+
+  // render 的真实长度（每行 '- ' + 20 字 = 22，行间 '\n' 1 字，前缀 '【头】\n' = 4）：
+  //   0 条 = 4 · 1 条 = 4+22 = 26 · 2 条 = 4+22+1+22 = 49 · 3 条 = 4+22+1+22+1+22 = 72
+  const THREE = ['a'.repeat(20), 'b'.repeat(20), 'c'.repeat(20)]
+
+  it('渲染超预算时从尾部逐个丢弃，直到落进预算（且 kept 与 text 始终一致）', () => {
+    const items = THREE
+    // 先把 render 的长度口径钉死，下面断言里的 2 才有依据（改 render 前缀/行前缀会导致本行先红）
+    expect([0, 1, 2, 3].map((n) => render(items.slice(0, n)).length)).toEqual([4, 26, 49, 72])
+    const r = fitByRenderedLength(items, 60, render)
+    expect(r.text.length).toBeLessThanOrEqual(60)
+    // 精确值（替代旧断言 r.kept.length < items.length）：72 > 60 → 丢 1 条得 49 ≤ 60 → 恰好保留 2 条。
+    // 「超预算就全丢」（kept: [] → 0 < 3 且 render([]) = 4 ≤ 60）在旧断言下三条全真，在此为红。
+    expect(r.kept).toHaveLength(2)
+    // 顺带钉住丢弃方向：如果实现改成从头部丢（丢高分的），这里拿到 [b, c] 会红
+    expect(r.kept).toEqual([items[0], items[1]])
+    // 保留尽量多：不得为了「保险」多丢一条（49 而不是 26）
+    expect(r.text.length).toBe(49)
+    expect(r.text).toBe(render(r.kept))
+  })
+
+  it('紧预算边界：恰好放得下 2 条（49）保留 2，少 1 字（48）只保留 1', () => {
+    const items = THREE
+    expect(render(items.slice(0, 2)).length).toBe(49)
+    expect(render(items.slice(0, 1)).length).toBe(26)
+    const at49 = fitByRenderedLength(items, 49, render)
+    expect(at49.text.length).toBeLessThanOrEqual(49)
+    expect(at49.kept).toHaveLength(2)                  // 49 ≤ 49：一条都不多丢
+    expect(at49.kept).toEqual([items[0], items[1]])
+    expect(at49.text).toBe(render(at49.kept))
+    const at48 = fitByRenderedLength(items, 48, render)
+    expect(at48.text.length).toBeLessThanOrEqual(48)
+    expect(at48.kept).toHaveLength(1)                  // 49 > 48：再丢一条 → 26 ≤ 48
+    expect(at48.kept).toEqual([items[0]])
+    expect(at48.text).toBe(render(at48.kept))
+    // 压到「空渲染刚好放得下」（budget = render([]) = 4）：必须收在 0 条，不能因循环条件写成
+    // kept.length > 1 而残留 1 条（26 > 4，等于击穿预算）
+    const at4 = fitByRenderedLength(items, 4, render)
+    expect(at4.kept).toHaveLength(0)
+    expect(at4.text).toBe(render([]))
+  })
+
+  it('单条就超预算 → 丢到空，而不是保留一条', () => {
+    const r = fitByRenderedLength(['x'.repeat(200)], 50, render)
+    expect(r.kept).toHaveLength(0)
+    expect(r.text).toBe(render([]))
+  })
+
+  // 紧预算的对照组：本用例 budget = 10000，只覆盖「宽预算世界」——无论实现是
+  // 「超预算全丢」、「按估算截断」还是「按需从尾部丢」，宽预算下都恒为 3 条全留，因此它
+  // 单独不能证明收敛逻辑正确；紧预算口径由上面两条（60 / 49 / 48 / 4）钉住。
+  it('反向对照：预算充足时一项不丢（证明不是一律丢）', () => {
+    const items = ['aa', 'bb', 'cc']
+    const r = fitByRenderedLength(items, 10_000, render)
+    expect(r.kept).toHaveLength(3)
+    expect(r.text).toBe(render(items))
+  })
+})
+
+// ── F7（第七轮）：undefined = 不改动，[] = 清空 ─────────────────────────────
+// 缺陷态：`links.length ? links : prev.links` —— 传空数组被当成「没传」，模型删不掉错标的 tag。
+describe('F7 tags/links：undefined 表示不改动，空数组表示清空', () => {
+  const input = (o: Partial<UpsertInput> = {}): UpsertInput => ({
+    key: 'rule.k', value: 'V', scope: 'global',
+    createdAt: '2026-09-17T00:00:00.000Z', updatedAt: '2026-09-17T00:00:00.000Z',
+    source: '测试', explicitSource: false, ...o,
+  })
+
+  it('传空数组清空旧 tags/links，并判为有变化', () => {
+    const items = [makeItem({ key: 'rule.k', value: 'V', tags: ['a'], links: ['x'] })]
+    const r = upsertMemory(items, input({ tags: [], links: [] }), { dedupe: false, makeId: () => 'n' })
+    expect(r.changed).toBe(true)
+    expect(items[0].tags).toEqual([])
+    expect(items[0].links).toEqual([])
+  })
+
+  it('不传则保留旧值，且判为空操作', () => {
+    const items = [makeItem({ key: 'rule.k', value: 'V', tags: ['a'], links: ['x'] })]
+    const r = upsertMemory(items, input(), { dedupe: false, makeId: () => 'n' })
+    expect(r.changed).toBe(false)
+    expect(items[0].tags).toEqual(['a'])
+    expect(items[0].links).toEqual(['x'])
+  })
+
+  it('反向对照：传新值替换而不是追加', () => {
+    const items = [makeItem({ key: 'rule.k', value: 'V', tags: ['a'], links: ['x'] })]
+    upsertMemory(items, input({ tags: ['b'] }), { dedupe: false, makeId: () => 'n' })
+    expect(items[0].tags).toEqual(['b'])
+    expect(items[0].links).toEqual(['x'])   // 没传 links → 不动
   })
 })

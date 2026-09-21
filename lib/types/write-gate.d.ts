@@ -47,8 +47,10 @@ export interface UpsertInput {
     key: string;
     value: string;
     full?: string;
-    links: string[];
-    tags: string[];
+    /** 关联 key：undefined = 不改动旧值；[] = 清空（F7，第七轮） */
+    links?: string[];
+    /** 标签：undefined = 不改动旧值；[] = 清空（F7，第七轮） */
+    tags?: string[];
     scope: string;
     createdAt: string;
     updatedAt: string;

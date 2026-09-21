@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { apply } from '../src/index'
 import { createStore } from '../src/store'
@@ -229,6 +229,107 @@ describe('T17 空操作防护：内容全等不刷新 updatedAt', () => {
     expect(r2.changed).toBe(false)
     expect(r3.changed).toBe(true)
     expect(r3.updatedAt >= r1.updatedAt).toBe(true)
+  })
+})
+
+// ── T17b（F3 回归）：render 文案优先级——空操作必须先于 mergedKey 判定 ──────────
+// 背景：render 曾按 mergedKey → created → changed → else 判定。dedupe 把新 key 合并到一条
+// 「内容全等」的旧条目时，mergedKey 非空、changed=false、items 未改动、updatedAt 仍是旧值，
+// 却报出「记忆已合并更新…」（模型会据此以为旧条目被刷新）。修复后先判空操作。
+// 复现路径（已在外部探针核实）：keySimilarity('rule.encoding-utf8','rule.encoding-utf9')
+// = 词元重叠 2/3 ≥ 0.6 阈值，故 utf9 会被并入 utf8。
+describe('T17 空操作防护：render 文案优先级（工具级 memory_set）', () => {
+  const VALUE = '读写文件一律用 utf-8 编码，禁止中文乱码'
+
+  /** 读出落盘条目（memory.jsonl，跳过 __schema 哨兵行） */
+  function storedItems(dir: string): any[] {
+    return readFileSync(join(dir, 'memory.jsonl'), 'utf8')
+      .split('\n').map((l) => l.trim()).filter(Boolean).map((l) => JSON.parse(l))
+      .filter((x: any) => x.key)
+  }
+
+  it('合并空操作：内容全等 → 报「已确认」而非「已合并更新」，时间戳仍是旧 updatedAt', async () => {
+    const { fake, dir } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    const mainFile = join(dir, 'memory.jsonl')
+    const bakFile = mainFile + '.bak'
+    // 断言前提本身：这条复现路径确实是靠 0.6 阈值上的相似度触发的合并（阈值若上调则本用例变红，不会静默失效）
+    expect(keySimilarity('rule.encoding-utf8', 'rule.encoding-utf9')).toBeCloseTo(2 / 3, 6)
+
+    const r1 = await setTool.execute({ key: 'rule.encoding-utf8', value: VALUE }, MAIN)
+    expect(r1.ok).toBe(true)
+    expect(r1.created).toBe(true)
+    expect(r1.changed).toBe(true)
+
+    // H7 写盘基线：store.writeItems 每次真写盘都会先 copyFile(主文件 → 主文件.bak) 再 rename 覆盖主文件。
+    // 本次是首次写盘（主文件原先不存在 → copyFile ENOENT 被静默吞掉），故此刻必然没有 .bak；
+    // 此后「.bak 是否出现」= 「是否又写过一次盘」。主文件字节 + mtime 作为第二重快照。
+    expect(existsSync(bakFile), '基线失效：首次写盘前主文件已存在，.bak 探针需重新标定').toBe(false)
+    const mainAfterFirstWrite = readFileSync(mainFile, 'utf8')
+    const mtimeAfterFirstWrite = statSync(mainFile).mtimeMs
+
+    // H7：两次调用之间拉开 100ms（远大于 Windows 系统时钟 ~15.6ms 的跳变粒度）。
+    // 若空操作分支被改成返回 new Date().toISOString()，这里必然拿到比 r1.updatedAt 晚 ≥100ms 的毫秒值，
+    // 「updatedAt 未刷新」不再靠「两次调用恰好落在同一毫秒」的运气（runner 越快越容易假绿）。
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const r2 = await setTool.execute({ key: 'rule.encoding-utf9', value: VALUE }, MAIN)
+    expect(r2.ok).toBe(true)
+    expect(r2.created).toBe(false)                   // 未新建
+    expect(r2.changed).toBe(false)                   // 内容全等 → 空操作
+    expect(r2.mergedKey).toBe('rule.encoding-utf8')  // 确实走了 dedupe 合并分支
+    expect(r2.updatedAt).toBe(r1.updatedAt)          // 未刷新更新时间（时间上已排除同毫秒巧合）
+
+    const text = setTool.output.render({ key: 'rule.encoding-utf9', value: VALUE }, r2)[0].text
+    expect(text).toContain('已确认')
+    expect(text).not.toContain('已合并更新')
+    // 空操作文案必须点名 mergedKey（而不是拿新 key 冒充），且时间戳 = 第一次写入的旧值
+    expect(text).toContain('与 global/rule.encoding-utf8 内容一致')
+    expect(text).toContain(`@ ${r1.updatedAt}`)
+
+    // ── H7 落盘层证据（与「时间戳是否相等」无关）──────────────────────────
+    // 空操作在 commitMemory 里整段跳过 writeItems：主文件既不该被重写（字节/mtime 原样），
+    // 也不该留下 .bak。任何「空操作仍落盘」的变异都会在这里变红，且不依赖毫秒精度。
+    expect(existsSync(bakFile), '空操作不该落盘：writeItems 一旦真跑过就必然生成 .bak').toBe(false)
+    expect(statSync(mainFile).mtimeMs).toBe(mtimeAfterFirstWrite)
+    expect(readFileSync(mainFile, 'utf8')).toBe(mainAfterFirstWrite)
+
+    // 文案与磁盘一致：只有第一条，且 updatedAt 未被刷新（空操作跳过整次落盘）
+    const stored = storedItems(dir)
+    expect(stored.map((x: any) => x.key)).toEqual(['rule.encoding-utf8'])
+    expect(stored[0].updatedAt).toBe(r1.updatedAt)
+    // 交叉核对：返回的 updatedAt 必须就是盘上那条的 updatedAt（返回值造假在这里露馅）
+    expect(r2.updatedAt).toBe(stored[0].updatedAt)
+  })
+
+  it('对照组：同一条合并路径但 value 不同 → 真合并更新，报「已合并更新」', async () => {
+    const { fake, dir } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    const V2 = '读写文件统一用 UTF-8；历史 GBK 文件先转码再入库'
+
+    const r1 = await setTool.execute({ key: 'rule.encoding-utf8', value: VALUE }, MAIN)
+    expect(r1.created).toBe(true)
+
+    const r2 = await setTool.execute({ key: 'rule.encoding-utf9', value: V2 }, MAIN)
+    expect(r2.created).toBe(false)
+    expect(r2.changed).toBe(true)                    // 内容真的变了
+    expect(r2.mergedKey).toBe('rule.encoding-utf8')  // 与上一用例同一条合并分支，唯一变量是 value
+    expect(r2.updatedAt >= r1.updatedAt).toBe(true)
+
+    const text = setTool.output.render({ key: 'rule.encoding-utf9', value: V2 }, r2)[0].text
+    expect(text).toContain('已合并更新')
+    expect(text).not.toContain('已确认')             // 反「一律报已确认」
+    expect(text).toContain(`@ ${r2.updatedAt}`)
+
+    const stored = storedItems(dir)
+    expect(stored).toHaveLength(1)
+    expect(stored[0].key).toBe('rule.encoding-utf8')
+    expect(stored[0].value).toBe(V2)
+    expect(stored[0].updatedAt).toBe(r2.updatedAt)
+    // 探针有效性对照（H7）：这条路径确实又写了一次盘 → writeItems 写前的 copyFile 必然留下 .bak。
+    // 若将来写盘路径不再产 .bak，本行会先红，提醒上一条「空操作无 .bak」的判据已失去区分力，
+    // 而不是让它静默退化成永远为真的废断言。
+    expect(existsSync(join(dir, 'memory.jsonl.bak')), '真更新必然落盘一次 → .bak 应出现').toBe(true)
   })
 })
 
@@ -513,5 +614,49 @@ describe('M9 readItems 容错', () => {
     expect(items).toHaveLength(1)
     expect(items[0].links).toEqual(['a', 'b'])
     expect(store.getDropped()).toBe(0)
+  })
+})
+
+// ── F7（第七轮）：memory_set 的 tags/links 传空数组 = 清空 ─────────────────
+// 缺陷态：`links.length ? links : prev.links` —— 传空数组被当成「没传」而保留旧值，
+// 模型删不掉一个错标的 tag；T17 之后这种写入还会被回以「记忆已确认」，更看不出没清掉。
+describe('F7 memory_set：tags / links 可以清空', () => {
+  function storedItems(dir: string): any[] {
+    return readFileSync(join(dir, 'memory.jsonl'), 'utf8')
+      .split('\n').map((l) => l.trim()).filter(Boolean).map((l) => JSON.parse(l))
+      .filter((x: any) => x.key)
+  }
+
+  it('传空数组 → 清空旧 tags/links，并判为有变化', async () => {
+    const { fake, dir } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    const r1 = await setTool.execute({ key: 'rule.f7', value: 'V', tags: ['a', 'b'], links: ['rule.other'] }, MAIN)
+    expect(r1.created).toBe(true)
+    // 落盘前提（HEAD 实测）：新建分支写的是 `links: links?.length ? links : undefined`——
+    // 非空数组原样落盘，空数组则整个字段不写（新建侧无 links 字段，更新侧才见得到 `"links":[]`）。
+    const created = storedItems(dir).find((x: any) => x.key === 'rule.f7')
+    expect(created.links).toEqual(['rule.other'])
+    expect(created.tags).toEqual(['a', 'b'])
+
+    const r2 = await setTool.execute({ key: 'rule.f7', value: 'V', tags: [], links: [] }, MAIN)
+    expect(r2.changed, '传空数组是清空，不是空操作').toBe(true)
+    const item = storedItems(dir).find((x: any) => x.key === 'rule.f7')
+    expect(item.tags).toEqual([])
+    // H4：这是**更新分支**，实测落盘形态是 `"links":[]`（字段存在且为空数组），不是删字段。
+    // 这里绝不能再写 `item.links ?? []`——那会把「字段被删成 undefined」也判成通过，
+    // 于是把清空语义改成 `links?.length ? links : undefined`（写回时删字段）的变异能在工具层静默存活。
+    expect(Object.prototype.hasOwnProperty.call(item, 'links'), '清空必须落成空数组字段，而不是把 links 字段删掉').toBe(true)
+    expect(item.links).toEqual([])
+  })
+
+  it('对照组：不传 tags/links → 保留旧值且判为空操作', async () => {
+    const { fake, dir } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    await setTool.execute({ key: 'rule.f7b', value: 'V', tags: ['a'], links: ['rule.other'] }, MAIN)
+    const r2 = await setTool.execute({ key: 'rule.f7b', value: 'V' }, MAIN)
+    expect(r2.changed).toBe(false)
+    const item = storedItems(dir).find((x: any) => x.key === 'rule.f7b')
+    expect(item.tags).toEqual(['a'])
+    expect(item.links).toEqual(['rule.other'])
   })
 })

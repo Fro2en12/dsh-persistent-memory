@@ -298,6 +298,32 @@ export function fitBudget(
   return { kept, used }
 }
 
+/**
+ * 按「渲染后真实长度」收敛（M11 收口；第七轮从 pre-step 的两处重复循环抽成纯函数，便于单测）。
+ *
+ * fitBudget 的 cost 是条目估算（value + key + 64），不含通道标题、行前缀与「🔗 关联」等包装——
+ * 实测每通道低估 17–22 字。直接按估算扣减，后续通道会据虚高的剩余额度误判（索引块挤进真实
+ * 已经不足的余额）。这里从尾部（分数最低的项）逐个丢弃，直到渲染长度落进 budget。
+ *
+ * @param items 已按分数排序的候选
+ * @param budget 本通道可用字符数
+ * @param render 把 kept 渲染成最终注入文本的纯函数
+ * @returns kept 与它的渲染结果；两者始终一致，调用方直接用 text.length 扣减预算
+ */
+export function fitByRenderedLength<T>(
+  items: T[],
+  budget: number,
+  render: (items: T[]) => string,
+): { kept: T[]; text: string } {
+  let kept = items
+  let text = render(kept)
+  while (kept.length > 0 && text.length > budget) {
+    kept = kept.slice(0, -1)
+    text = render(kept)
+  }
+  return { kept, text }
+}
+
 // 在句子边界（。；！？/换行/空格）截断，避免"…dsh-file-…"这种半截文字。
 // T14：省略号计入 maxChars —— 返回值长度恒 ≤ max（旧实现硬截断分支返回 max+1，
 // 让「value ≤ valueMaxChars 字」的数据口径不成立）。句边界分支同样从 max-1 的头部里取。
