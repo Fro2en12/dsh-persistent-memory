@@ -14,6 +14,10 @@ export declare function validateKeyPrefix(key: string, scope: string): void;
 /**
  * M2/S5 增强版凭据正则：写侧拒绝 / 提取器 / 导入闸门共用同一份（防止实现漂移）。
  * 覆盖：弱关键词（token/secret/api key/access key/AccountKey/password/中文口令）、
+ * 弱关键词口径（P2-2 复审收口）：ASCII 词加 \b 与可选复数，避免 passwordless / tokenizer 这类
+ *   **词内**命中误拒正常记忆；但「裸词出现即命中」仍是有意的 fail-closed 契约（语料钉住了
+ *   'my secret is xyz' 与 '含 token 明文' 两例），所以 `token 预算` 这类会被拒——已知过宽，
+ *   逃生路径是改写措辞或用 auth.*。中文词不加 \b（JS 的 \b 对 CJK 无效）。
  * 授权头（Bearer 长串 / Authorization: Basic|Bearer|Token <base64>）、常见厂商前缀
  * （sk-/sk-ant-/sk-proj-/sk_live_/ghp_/github_pat_/glpat-/xox./npm_/AKIA/ASIA）、
  * JWT、带账号密码的连接串、PRIVATE KEY 块。

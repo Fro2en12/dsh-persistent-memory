@@ -51,9 +51,12 @@ export declare function fitBudget(items: MemoryItem[], budget: number, maxChars:
  * 已经不足的余额）。这里从尾部（分数最低的项）逐个丢弃，直到渲染长度落进 budget。
  *
  * @param items 已按分数排序的候选
- * @param budget 本通道可用字符数
- * @param render 把 kept 渲染成最终注入文本的纯函数
- * @returns kept 与它的渲染结果；两者始终一致，调用方直接用 text.length 扣减预算
+ * @param budget 本通道可用字符数；必须是有限数（调用方保证）。非有限值时不做裁剪原样返回——
+ *   NaN 下 `text.length > budget` 恒 false，属 fail-open，故这里只文档化、不额外兜底。
+ * @param render 把 kept 渲染成最终注入文本的函数（每轮迭代都会重新调用，故调用方应保持它无副作用）
+ * @returns kept 与它的渲染结果；两者始终一致，调用方直接用 text.length 扣减预算。
+ *   边界：budget ≤ 0 或单条就超预算时 kept 为空，此时 text 是 render([])（可能仍长于 budget，
+ *   那是通道标题的固定开销，调用方以 kept.length > 0 为护栏）。
  */
 export declare function fitByRenderedLength<T>(items: T[], budget: number, render: (items: T[]) => string): {
     kept: T[];

@@ -5,7 +5,6 @@ export declare const inject: string[];
 export interface Config {
     /** 记忆库目录；缺省为 $DSH_HOME/dsh-persistent-memory */
     dataDir?: string;
-    /** 未显式传 scope 时使用的默认作用域 */
     defaultScope?: string;
     /** search/stats 返回条数上限 */
     maxResults?: number;
@@ -27,7 +26,7 @@ export interface Config {
     autoRecallFallback?: boolean;
     /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
     autoCapture?: boolean;
-    /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
+    /** 单轮「教训+召回+索引」的字符总预算（默认 1200，下限 300）。守则是每会话固定成本，不计入此额度 */
     injectionBudgetChars?: number;
     /** 每个会话只自动注入一次记忆；冷却期内不重复注入（默认 true） */
     autoRecallOnce?: boolean;
