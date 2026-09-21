@@ -72,7 +72,11 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
         createdAt: now,
         updatedAt: now,
         source: '轮末提取',
-        explicitSource: true,
+        // P2-1（复审收口）：explicitSource=true 会让 upsertMemory 用常量 '轮末提取' 覆盖掉
+        // memory_set 写下的「日期+会话」引证，并且因为 prev.source !== '轮末提取' 而让合并路径
+        // 的 changed 恒为真——T17 的省盘在提取器路径几乎失效。改为 false：已有条目保留原引证
+        // （不参与 changed 比较），新建条目仍由 upsertMemory 的 push 分支写入 '轮末提取'。
+        explicitSource: false,
       }, { dedupe: true, makeId })
       // M12 容量守卫（第七轮补）：与 memory_set:1365 同口径——只挡「新增」，更新已有 key 不受限。
       // 修复前提取器完全不看 maxItems，只受 EXTRACT_LIBRARY_SOFT_CAP 软上限约束，且 rule/lesson
@@ -98,11 +102,13 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
   // session-persistence-jsonl/src/storage.ts:536）。要看它需挂 logger-console 且 levels.default ≥ 2。
   async function extractAndWrite(sid: string, dialogue: string): Promise<void> {
     const llm = ctx.get('llm') as any
-    if (!llm) return
+    // P2-11（复审）：这几处原先静默返回，「提取器空转」与「正常但本轮无候选」不可区分。
+    // 环境类原因用 debug（每轮都有，不该刷屏），内容类原因用 info（真的出现了异常回包）。
+    if (!llm) { ctx.logger.debug('[mem] extract skipped: llm service unavailable'); return }
     const sel = (ctx.get('agentDefaultModel') as any)?.currentSelection?.() as { provider?: string; model?: string } | undefined
     const provider = sel?.provider
     const model = sel?.model
-    if (!provider || !model) return
+    if (!provider || !model) { ctx.logger.debug('[mem] extract skipped: no provider/model selected'); return }
     const timeout = AbortSignal.timeout(5000)
     const textChunks: string[] = []
     try {
@@ -129,9 +135,9 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
     }
     const text = textChunks.join('').trim()
     const m = text.match(/\{[\s\S]*\}/)
-    if (!m) return
+    if (!m) { ctx.logger.info('[mem] extract: LLM reply contained no JSON object — nothing extracted'); return }
     let parsed: any
-    try { parsed = JSON.parse(m[0]) } catch { return }
+    try { parsed = JSON.parse(m[0]) } catch { ctx.logger.info('[mem] extract: LLM reply JSON parse failed'); return }
     const memories = Array.isArray(parsed?.memories) ? parsed.memories : []
     let written = 0
     // 上限由 slice(0, 3) 决定；原先这里还有一句 if (written >= 3) break —— 每轮至多 +1 且候选 ≤3，
@@ -159,10 +165,9 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
     if (droppedByCapacity > 0) {
       ctx.logger.warn('[mem] extract: library at maxItems=%d, %d candidate(s) dropped — run memory_dream', maxItems, droppedByCapacity)
     }
-    if (written > 0 || skipped > 0) {
-      ctx.logger.info('[mem] extract: %d written, %d skipped%s', written, skipped,
-        droppedByCapacity > 0 ? ` (${droppedByCapacity} dropped: library at maxItems=${maxItems}; run memory_dream)` : '')
-    }
+    // P2-11：无论是否写入都留一条摘要——「提取器跑过但 0 候选」与「压根没跑」必须可区分。
+    ctx.logger.info('[mem] extract: %d candidate(s), %d written, %d skipped%s', memories.length, written, skipped,
+      droppedByCapacity > 0 ? ` (${droppedByCapacity} dropped: library at maxItems=${maxItems}; run memory_dream)` : '')
   }
 
   if (autoExtract) {

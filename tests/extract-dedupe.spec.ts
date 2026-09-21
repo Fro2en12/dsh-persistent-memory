@@ -309,3 +309,36 @@ describe('复审 P1-2 提取器容量拒绝的可见性', () => {
     expect(readFileSync(join(dir, 'memory.jsonl'), 'utf8'), '超限候选不得落盘').not.toContain('cannot-add')
   })
 })
+
+// ── 复审 P2：提取器不得覆盖用户的 source 引证 / 不得静默吞掉异常回包 ──────────
+describe('复审 P2 提取器收口', () => {
+  it('P2-1 合并到已有条目时保留用户写的 source，且内容全等不刷新 updatedAt', async () => {
+    const now = '2026-09-17T00:00:00.000Z'
+    const dir = makeTempDir()
+    tmpDirs.push(dir)
+    const seed = [{ id: 'x', key: 'env.node-version', value: '本机 Node v26.8.1', scope: 'global', tags: [], createdAt: now, updatedAt: now, source: '2026-09-17 s=SEED' }]
+    writeFileSync(join(dir, 'memory.jsonl'), seed.map((s) => JSON.stringify(s)).join('\n') + '\n', 'utf8')
+    const fake = makeFakeCtx({}, {
+      llm: { stream: async function* () { yield { type: 'text-delta', text: JSON.stringify({ memories: [{ key: 'env.nodejs-version', value: '本机 Node v26.8.1', tags: [] }] }) } } },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    })
+    apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: true, autoExtractCooldownMs: 30000 })
+    feedTurn(fake, 'sess-p21', '记住这个')
+    expect(await waitLog(fake, '[mem] extract:'), '必须留下摘要').toBe(true)
+    const item = parseItems(dir).find((x: any) => x.key === 'env.node-version')
+    expect(item.source, 'P2-1：用户写的引证不得被常量覆盖').toBe('2026-09-17 s=SEED')
+    expect(item.updatedAt, 'P2-1：内容全等 ⇒ 不因 source 差异被判为变化').toBe(now)
+  })
+
+  it('P2-11 LLM 回包不含 JSON 时必须留下可见痕迹（不再静默返回）', async () => {
+    const dir = makeTempDir()
+    tmpDirs.push(dir)
+    const fake = makeFakeCtx({}, {
+      llm: { stream: async function* () { yield { type: 'text-delta', text: '抱歉，我无法提取。' } } },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    })
+    apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: true, autoExtractCooldownMs: 30000 })
+    feedTurn(fake, 'sess-p211', '记住这个')
+    expect(await waitLog(fake, 'no JSON object'), 'P2-11：非 JSON 回包必须留痕').toBe(true)
+  })
+})

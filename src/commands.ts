@@ -105,7 +105,18 @@ export function registerCommands(ctx: Context, deps: MemoryDeps, writeOps: Write
         try {
           const r = await writeOps.commitMemory({ key, value, scope: defaultScope, source: 'slash:/memory remember', fromUser: true })
           const warnText = r.warnings?.length ? '\n⚠️ ' + r.warnings.join('；') : ''
-          return { kind: 'success', text: `已写入记忆：${r.scope}/${r.key}${warnText}` }
+          // P2-3（复审）：commitMemory 早已返回 changed/mergedKey，命令面却一律报「已写入」——
+          // 内容全等（未落盘）与「合并到另一个 key」都会被读成写进去了，用户据此以为该 key 存在。
+          // 与 memory_set 的 render 保持同一套语义。
+          let action: string
+          if (!r.changed && !r.created) {
+            action = r.mergedKey
+              ? `已确认：与 ${r.scope}/${r.mergedKey} 内容一致（未新建、未刷新更新时间）`
+              : `已确认：${r.scope}/${r.key}（内容与旧值一致，未刷新更新时间）`
+          } else if (r.mergedKey) action = `已合并更新：${r.scope}/${r.mergedKey}（与新 key "${r.key}" 高度相似，未新建条目）`
+          else if (r.created) action = `已写入记忆：${r.scope}/${r.key}`
+          else action = `已更新记忆：${r.scope}/${r.key}`
+          return { kind: 'success', text: `${action}${warnText}` }
         } catch (err) {
           return { kind: 'error', text: String(err instanceof Error ? err.message : err) }
         }

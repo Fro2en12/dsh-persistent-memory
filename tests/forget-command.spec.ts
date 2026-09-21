@@ -105,3 +105,16 @@ describe('M14 /memory remember 复用写侧闸门', () => {
     await expect(setTool.execute({ key: 'rule.model', value: 'v' }, MAIN)).rejects.toThrow(/写入审批/)
   })
 })
+
+describe('P2-3 /memory remember 的文案要区分空操作', () => {
+  it('内容全等时报「已确认」，不再一律报「已写入记忆」', async () => {
+    const { fake } = setup()
+    const r1 = await memoryCmd(fake)('remember rule.duptext 同一段内容')
+    expect(r1.kind).toBe('success')
+    expect(r1.text).toContain('已写入记忆')
+    const r2 = await memoryCmd(fake)('remember rule.duptext 同一段内容')
+    expect(r2.kind).toBe('success')
+    expect(r2.text, 'P2-3：空操作不得报成写入').toContain('已确认')
+    expect(r2.text).not.toContain('已写入记忆')
+  })
+})

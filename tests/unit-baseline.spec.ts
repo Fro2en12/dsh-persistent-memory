@@ -388,3 +388,17 @@ describe('F7 tags/links：undefined 表示不改动，空数组表示清空', ()
     expect(items[0].links).toEqual(['x'])   // 没传 links → 不动
   })
 })
+
+// ── P2-2（复审）：裸关键词加词边界，修掉词内命中，同时保住「裸词即命中」的既有契约 ──
+describe('P2-2 凭据裸关键词的词内误判', () => {
+  it('passwordless / tokenizer 这类词内出现不再判为凭据', () => {
+    expect(findCredentialMatch('ssh passwordless 登录已配好'), 'passwordless 误判').toBeNull()
+    expect(findCredentialMatch('tokenizer 用的是 BPE 分词'), 'tokenizer 误判').toBeNull()
+  })
+  it('反向对照：裸词与复数、中文词、赋值形态仍全部命中（原有契约不变）', () => {
+    expect(findCredentialMatch('my secret is xyz')).not.toBeNull()
+    expect(findCredentialMatch('token=abc')).not.toBeNull()
+    expect(findCredentialMatch('tokens 已经用完了')).not.toBeNull()
+    expect(findCredentialMatch('密码是123456')).not.toBeNull()
+  })
+})
