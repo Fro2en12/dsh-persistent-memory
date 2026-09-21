@@ -148,3 +148,20 @@ describe('M12 1000 条库检索性能', () => {
     expect(ms).toBeLessThan(200)
   })
 })
+
+describe('复审修复：restore 的 full 上限', () => {
+  it('F1 导出文件里的超长 full 必须在入库时按 fullMaxChars 截断', async () => {
+    const dir = makeTempDir()
+    tmpDirs.push(dir)
+    const src = join(dir, 'in.json')
+    const huge = 'Y'.repeat(50000)
+    writeFs(src, JSON.stringify({ version: 1, exportedAt: 'x', items: [{ id: 'a', key: 'ref.hugefull', value: 'v', full: huge, scope: 'global', tags: [], createdAt: 'x', updatedAt: 'x' }] }), 'utf8')
+    const fake = makeFakeCtx()
+    apply(fake.ctx, { dataDir: dir, defaultScope: 'global', autoRecall: false, autoCapture: false, autoExtract: false, fullMaxChars: 2000, importAllowRoots: [dir] })
+    const r = await cmd(fake)(`restore ${src}`)
+    expect(r.kind).toBe('success')
+    const get = fake.toolDefs.get('memory_get')
+    const item = await get.execute({ key: 'ref.hugefull', includeFull: true }, MAIN)
+    expect(item.full.length, 'restore 是唯一没设限的写入入口，必须与其它路径同口径').toBeLessThanOrEqual(2000)
+  })
+})

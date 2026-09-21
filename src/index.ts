@@ -73,7 +73,7 @@ export interface Config {
   autoRecallFallback?: boolean
   /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
   autoCapture?: boolean
-  /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
+  /** 单轮「教训+召回+索引」的字符总预算（默认 1200，下限 300）。守则是每会话固定成本，不计入此额度 */
   injectionBudgetChars?: number
   /** 每个会话只自动注入一次记忆；冷却期内不重复注入（默认 true） */
   autoRecallOnce?: boolean
@@ -1061,7 +1061,9 @@ export function apply(ctx: Context, config: Config): void {
       const sid = String(
         payload.agent?.session?.id ?? payload.agent?.session?.sessionId ?? 'default',
       )
-      const claimed = payload.messages as unknown[]
+      // R2（复审）：原先直接 as unknown[]，messages 非数组时 claimed.includes 会在 try 之外抛
+      // TypeError，违反本文件「观察者绝不抛」的约定（DSH 侧恒为数组，属健壮性收口）。
+      const claimed: unknown[] = Array.isArray(payload.messages) ? (payload.messages as unknown[]) : []
       const entered: unknown[] = Array.isArray(decision?.messages) ? [...(decision.messages as unknown[])] : []
       const lastClaimedIndex = entered.findLastIndex((item) => claimed.includes(item))
       let changed = false
@@ -1261,7 +1263,9 @@ export function apply(ctx: Context, config: Config): void {
           if (runtime.autoCapture && payload.step === 1 && decision && Array.isArray(decision.messages)) {
             const guideKey = `${sid}:capture-guide`
             const guideForm = isSubagentAgent(payload.agent) ? 'memory-capture-guide-subagent' : AUTO_CAPTURE_FORM
-            if (!sessionInjections.has(guideKey)) {
+            // R2（复审）：兜底路径必须与主路径同口径——只判 sessionInjections 时，注入状态文件
+            // 丢失/过期（插件重载）会在这里重复注入整份守则（实测 3066 字 + 历史那条共 2 份）。
+            if (!sessionInjections.has(guideKey) && !entered.some((message: unknown) => isOwnInjected(message, guideForm))) {
               const guideText = buildGuideText(payload.agent)
               entered.splice(lastClaimedIndex + 1, 0, {
                 role: 'user',
@@ -1269,7 +1273,8 @@ export function apply(ctx: Context, config: Config): void {
                 content: [{ type: 'text', text: guideText }],
                 source: { kind: 'plugin', plugin: name, form: guideForm, summary: '记忆守则自动注入' },
               })
-              sessionInjections.set(guideKey, Date.now())
+              // R2（复审）：与其余 5 处一致走 setBounded——裸 set 绕过 T4 的 max=200 上界
+              setBounded(sessionInjections, guideKey, Date.now())
               persistInjectionState()
               return { kind: 'enter', messages: entered }
             }
@@ -1494,6 +1499,7 @@ export function apply(ctx: Context, config: Config): void {
           source: { type: 'string' },
           updatedAt: { type: 'string' },
           masked: { type: 'boolean' },
+          fullTruncated: { type: 'boolean' },
         },
       },
       render: (_args, value) => {
@@ -1509,11 +1515,14 @@ export function apply(ctx: Context, config: Config): void {
           value.tags?.length ? `标签 ${value.tags.map(neutral).join(', ')}` : '',
           value.links?.length ? `关联 ${value.links.map(neutral).join(', ')}` : '',
         ].filter(Boolean).join(' · ')
+        // F4（复审）：render 自带防线，不把安全完全押在 execute 先清洗上——
+        // value/full 在这里也过一次定界符中和（幂等：已中和过的串不再匹配）。
         const body = [
-          `记忆 ${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}：${value.value}`,
+          `记忆 ${escapeMemoryAttr(value.scope)}/${escapeMemoryAttr(value.key)}：${neutral(value.value)}`,
           ...(meta ? [meta] : []),
           ...(value.masked ? ['（凭据已掩码：默认不返回原文，需部署者开启 allowCredentialReveal 且 confirmed:true）'] : []),
-          ...(value.full ? ['--- 完整正文 ---', value.full] : []),
+          ...(value.full ? ['--- 完整正文 ---', neutral(value.full)] : []),
+          ...(value.fullTruncated ? [`（完整正文超过 ${fullMaxChars} 字上限，已截断）`] : []),
         ].join('\n')
         return [{ type: 'text', text: `<memory-data trust="untrusted" scope="${escapeMemoryAttr(value.scope)}" key="${escapeMemoryAttr(value.key)}">${body}</memory-data>` }]
       },
@@ -1543,11 +1552,20 @@ export function apply(ctx: Context, config: Config): void {
           scope,
           // C4：清洗下移到工具输出面——检索通道不再返回原文投毒串；C7 再叠加凭据掩码
           value: masked ? maskCredential(item.value) : sanitizeValue(item.value),
-          ...(includeFull && item.full && !masked ? { full: sanitizeValue(item.full) } : {}),
+          // F1（复审）：读取侧也必须设上限。写入侧三条路径都按 fullMaxChars 截断，但 store 里
+          // 可能留有更早版本或 /memory restore 灌进来的超长 full（那是唯一没设限的入口），
+          // 而 render 现在会把 full 原文交给模型——不截断等于一次 restore 就能把单条注入放到 MB 级。
+          ...(includeFull && item.full && !masked ? {
+            full: sanitizeValue(item.full).slice(0, fullMaxChars),
+            ...(item.full.length > fullMaxChars ? { fullTruncated: true } : {}),
+          } : {}),
           ...(masked ? { masked: true } : {}),
           tags: item.tags,
           ...(item.links?.length ? { links: item.links } : {}),
-          ...(item.source ? { source: item.source } : {}),
+          // F3（复审）：source 是 memory_set 的显式入参（模型可控），与 value 同口径清洗；
+          // tags/links 是标识符，必须逐字节可回用（sanitizeValue 的 NFKC 会改写它们），
+          // 因此只做定界符中和（render 侧），不在这里做语义清洗。
+          ...(item.source ? { source: sanitizeValue(item.source) } : {}),
           updatedAt: item.updatedAt,
         }
       })
@@ -1589,7 +1607,16 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => {
         if (!value.count) return [{ type: 'text', text: '没有匹配的记忆。' }]
-        const lines = value.items.map((item) => `<memory-data trust="untrusted" scope="${escapeMemoryAttr(item.scope)}" key="${escapeMemoryAttr(item.key)}">- ${escapeMemoryAttr(item.scope)}/${escapeMemoryAttr(item.key)}: ${item.value}</memory-data>`)
+        // F2（复审）：schema 声明了 tags/updatedAt 却从不输出 ⇒ 模型看不见（N2 同型）。
+        // 天龄是守则「引用前先验证现状」的直接依据，标签是检索维度，都补进结果行。
+        const neutral = (s: unknown) => neutralizeMemoryDataDelimiters(String(s))
+        const lines = value.items.map((item) => {
+          const meta = [
+            item.updatedAt ? ageLabel(item.updatedAt) : '',
+            item.tags?.length ? `标签 ${item.tags.map(neutral).join(', ')}` : '',
+          ].filter(Boolean).join(' · ')
+          return `<memory-data trust="untrusted" scope="${escapeMemoryAttr(item.scope)}" key="${escapeMemoryAttr(item.key)}">- ${escapeMemoryAttr(item.scope)}/${escapeMemoryAttr(item.key)}${meta ? ' · ' + meta : ''}: ${item.value}</memory-data>`
+        })
         return [{ type: 'text', text: `找到 ${value.count} 条记忆：\n${lines.join('\n')}` }]
       },
     },
@@ -2028,7 +2055,9 @@ export function apply(ctx: Context, config: Config): void {
         id: typeof e.id === 'string' && e.id ? e.id : makeId(),
         key: e.key.trim(),
         value: e.value,
-        ...(typeof e.full === 'string' ? { full: e.full } : {}),
+        // F1（复审）：restore 是四条写入路径里唯一不设 full 上限的入口；导出文件里的 full 原样入库后，
+        // memory_get(includeFull) 会把它整段送进模型上下文。与 memory_set / memory_dream 同口径截断。
+        ...(typeof e.full === 'string' ? { full: e.full.slice(0, fullMaxChars) } : {}),
         ...(links.length ? { links } : {}),
         scope: normalizeScope(typeof e.scope === 'string' ? e.scope : '', defaultScope),
         tags,
