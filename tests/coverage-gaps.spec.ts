@@ -181,6 +181,57 @@ describe('M9 写侧闸门：dedupeOnSet=false 相似 key 不合并', () => {
   })
 })
 
+// ── T17（第六轮）：空操作更新防护（清单：code-quality-universal「空操作更新」）──
+describe('T17 空操作防护：内容全等不刷新 updatedAt', () => {
+  it('upsertMemory：value/tags 全等 → changed=false，updatedAt 原样返回旧值', () => {
+    const items = [mkItem({ key: 'rule.same', value: '同一段内容', tags: ['a'], updatedAt: '2026-09-01T00:00:00.000Z' })]
+    const r = upsertMemory(items, upsertInput({ key: 'rule.same', value: '同一段内容', tags: ['a'] }), { dedupe: true, makeId: () => 'id-new' })
+    expect(r.changed).toBe(false)
+    expect(r.created).toBe(false)
+    expect(r.updatedAt).toBe('2026-09-01T00:00:00.000Z')
+    expect(items[0].updatedAt).toBe('2026-09-01T00:00:00.000Z')
+  })
+
+  it('对照组：value 改一个字符 → changed=true，时间戳随本次输入前进', () => {
+    const items = [mkItem({ key: 'rule.same', value: '同一段内容', tags: ['a'] })]
+    const r = upsertMemory(items, upsertInput({ key: 'rule.same', value: '同一段内容。', tags: ['a'] }), { dedupe: true, makeId: () => 'id-new' })
+    expect(r.changed).toBe(true)
+    expect(r.updatedAt).toBe('2026-09-17T00:00:00.000Z')
+    expect(items[0].value).toBe('同一段内容。')
+  })
+
+  it('数组按值比较：新建的同内容 tags 数组仍判空操作，少一项才判变化', () => {
+    const items = [mkItem({ key: 'rule.same', value: 'V', tags: ['a', 'b'] })]
+    const same = upsertMemory(items, upsertInput({ key: 'rule.same', value: 'V', tags: ['a', 'b'] }), { dedupe: true, makeId: () => 'id-new' })
+    expect(same.changed).toBe(false)
+    const shorter = upsertMemory(items, upsertInput({ key: 'rule.same', value: 'V', tags: ['a'] }), { dedupe: true, makeId: () => 'id-new' })
+    expect(shorter.changed).toBe(true)
+  })
+
+  it('工具级：连续两次写相同内容 → 第二次 changed=false 且 updatedAt 不前进', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    const r1 = await setTool.execute({ key: 'rule.idem', value: '幂等内容', tags: ['x'] }, MAIN)
+    expect(r1.changed).toBe(true)
+    const r2 = await setTool.execute({ key: 'rule.idem', value: '幂等内容', tags: ['x'] }, MAIN)
+    expect(r2.changed).toBe(false)
+    expect(r2.created).toBe(false)
+    expect(r2.updatedAt).toBe(r1.updatedAt)
+  })
+
+  it('工具级对照组：第三次改内容 → changed=true（证明不是一律不刷新）', async () => {
+    const { fake } = setup()
+    const setTool = fake.toolDefs.get('memory_set')
+    const r1 = await setTool.execute({ key: 'rule.idem2', value: '第一版' }, MAIN)
+    const r2 = await setTool.execute({ key: 'rule.idem2', value: '第一版' }, MAIN)
+    const r3 = await setTool.execute({ key: 'rule.idem2', value: '第二版' }, MAIN)
+    expect(r1.changed).toBe(true)
+    expect(r2.changed).toBe(false)
+    expect(r3.changed).toBe(true)
+    expect(r3.updatedAt >= r1.updatedAt).toBe(true)
+  })
+})
+
 // ── 3) 写侧闸门：内容冲突检测（≥55% → clashKey/clashSim 警告）──────────
 describe('M9 写侧闸门：内容冲突检测 ≥55%', () => {
   it('upsertMemory：相似度 ≥55% → 返回 clashKey/clashSim，条目仍新建（不静默并存另一条也不吞掉新条）', () => {

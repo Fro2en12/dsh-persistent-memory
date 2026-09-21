@@ -27,8 +27,6 @@ export interface Config {
     autoRecallFallback?: boolean;
     /** 是否注入“自动记忆守则”，让模型自己发现并总结值得记住的信息 */
     autoCapture?: boolean;
-    /** 守则详略：brief（默认，实测约 282 字，口径与 README 统一写「约 300 字」）| full（完整九类细则，约 3000 字） */
-    autoCaptureDetail?: 'brief' | 'full';
     /** 单轮全部自动注入（守则+教训+召回+索引）的会话级字符总预算（默认 1200） */
     injectionBudgetChars?: number;
     /** 每个会话只自动注入一次记忆；冷却期内不重复注入（默认 true） */
@@ -88,7 +86,6 @@ export declare const Config: z<Schemastery.ObjectS<{
     autoRecallScope: z<string, string>;
     autoRecallFallback: z<boolean, boolean>;
     autoCapture: z<boolean, boolean>;
-    autoCaptureDetail: z<string, string>;
     autoRecallOnce: z<boolean, boolean>;
     autoRecallCooldownMs: z<number, number>;
     synonymExpansion: z<boolean, boolean>;
@@ -121,7 +118,6 @@ export declare const Config: z<Schemastery.ObjectS<{
     autoRecallScope: z<string, string>;
     autoRecallFallback: z<boolean, boolean>;
     autoCapture: z<boolean, boolean>;
-    autoCaptureDetail: z<string, string>;
     autoRecallOnce: z<boolean, boolean>;
     autoRecallCooldownMs: z<number, number>;
     synonymExpansion: z<boolean, boolean>;

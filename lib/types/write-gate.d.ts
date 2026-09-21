@@ -60,6 +60,10 @@ export interface UpsertInput {
 export interface UpsertResult {
     created: boolean;
     mergedKey: string;
+    /** T17：内容是否真的变化。false = 空操作（同 scope+key 且 value/full/links/tags/source 与旧值全等） */
+    changed: boolean;
+    /** T17：实际生效的 updatedAt——空操作时不刷新，原样返回旧值 */
+    updatedAt: string;
     /** 内容高度相似（≥55%）但未合并的已有条目 key（供警告） */
     clashKey?: string;
     clashSim?: number;

@@ -46,7 +46,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 
 | 机制 | 说明 |
 |---|---|
-| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（`autoCaptureDetail` 默认 `brief` 精简版约 300 字；显式配 `full` 才注入完整九类细则约 3000 字）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
+| 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（约 3050 字；第六轮起不再提供精简版，每会话只注入完整守则）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
 | 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
 | LLM 语义重排 | 候选 ≥1 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
@@ -57,7 +57,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 | 来源引证 | `memory_set` 自动填「日期+会话 id」，召回行展示 `· 自2026-09-01 s=xxx` |
 | 子代理隔离 | 子代理会话注入只读守则 + `memory_set` 硬层拒绝写 global（提示 `scope=sub:<id>`）；`memory_get` 读 `auth.*` 被硬层拒绝；`memory_search` 不带 scope 时只返回 `sub:<id>` 与当前工作区 scope（不含 global，结果亦排除 auth.*）；成果回传父会话沉淀 |
 | 记忆代谢 | `memory_dream` 工具 + `/memory dream`：task 超 30 天 / 任意超 90 天 / 标记完成超 14 天出候选，由模型决定更新/归档/删除；`memory_dream({ apply: true })` 直接归档——>90 天条目 value 压缩为摘要、原文移入 `full` |
-| 注入预算 | 条数上限（`autoRecallLimit`，默认 2）+ 会话级总预算 `injectionBudgetChars`（默认 1200）：单轮「守则 + 教训 + 召回 + 索引」共享，按优先级串行分配——守则是静态文案不受砍，剩余预算不足时依次挤掉教训/召回/索引；单通道预算 `autoRecallBudgetChars`（v0.1.20 起默认 300，原 600）与剩余总预算取小，超出按分数顺序截断（单条成本约 200 字，300 的预算实际多为 1 条、偶尔 2 条）；漂移警告合并为一段而非每条一段（v0.1.16） |
+| 注入预算 | 条数上限（`autoRecallLimit`，默认 2）+ 会话级总预算 `injectionBudgetChars`（默认 1200）：单轮「教训 + 召回 + 索引」共享，按优先级串行分配——**守则是每会话固定成本、不计入预算**（第六轮解耦：它本来就永不被砍，占额度只会让大守则静默挤掉记忆通道）；剩余预算不足时依次挤掉教训/召回/索引；单通道预算 `autoRecallBudgetChars`（v0.1.20 起默认 300，原 600）与剩余总预算取小，超出按分数顺序截断（单条成本约 200 字，300 的预算实际多为 1 条、偶尔 2 条）；漂移警告合并为一段而非每条一段（v0.1.16） |
 | 召回阈值 | 绝对下限 + 相对比例组合（v0.1.17）：`autoRecallMinScore`（默认 3）挡住"整体都不相关"；`autoRecallRelativeFloor`（默认 0.5）只留与最高分同量级的，挡住"矮子里拔将军" |
 | 补位收口 | `rrfFirstTurnOnly`（默认 true，v0.1.18）：RRF 语义补位只在首轮兜底；非首轮词法被阈值过滤即整体不相关，注入 0 条而非用另一通道放回排名靠前的记忆 |
 | 注入去重 | 会话注入状态落盘 `session-injections.json`（v0.1.19，30 天 TTL）+ form 级去重（不再比对正文）：内存 Map 重启即失效会让同一会话每重启一次重复注入一份守则/召回（实测 5 次 = 8722 字） |
@@ -70,7 +70,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 
 ## 模型工具
 
-- `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）；库达 `maxItems`（默认 2000）后拒绝**新增**（更新已有 key 不受限），错误提示跑 `memory_dream`；`/memory restore` 作为救援通道不受此限
+- `memory_set` — 写入/更新（同 scope+key 覆盖；`full` 长文、`links` 关联、`confirmed` 审批门、`source` 引证）；库达 `maxItems`（默认 2000）后拒绝**新增**（更新已有 key 不受限），错误提示跑 `memory_dream`；`/memory restore` 作为救援通道不受此限；内容与旧值**全等**时按空操作处理（T17）：不刷新 `updatedAt`、不落盘，返回 `changed: false`，工具文本报「已确认」——避免反复重申让旧记忆伪装新鲜，污染召回排序与 `memory_dream` 的过期判定
 - `memory_get` — 按 key 读取（`includeFull` 才返回完整正文；凭据类条目默认掩码，需部署者 `allowCredentialReveal: true` 且带 `confirmed: true` 才可能取回原文）
 - `memory_search` — 关键词/标签/作用域搜索
 - `memory_forget` — 删除一条
@@ -117,8 +117,7 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
         autoCapture: true           # 每会话注入记忆守则
         autoExtract: true           # 轮末自动提取（默认开，可在 cordis.yml 关闭）
         autoExtractCooldownMs: 120000  # 同一会话提取冷却（默认 120s）
-        autoCaptureDetail: brief    # 守则详略：brief（默认，精简版约 300 字）| full（完整九类细则约 3000 字，需显式配置）
-        injectionBudgetChars: 1200  # 单轮「守则+教训+召回+索引」会话级字符总预算（默认 1200，下限 300；守则是静态文案不受砍）
+        injectionBudgetChars: 1200  # 单轮「教训+召回+索引」字符总预算（默认 1200，下限 300；守则不计入，每会话固定注入）
         autoRecallBudgetChars: 300  # 单次召回注入字符预算（默认 300 ≈ 1 条），超出按分数截断
         autoRecallMinScore: 3       # 非首轮召回的绝对分数下限（原 1 过松，会注入无关记忆）
         autoRecallRelativeFloor: 0.5 # 相对阈值：低于最高分该比例的记忆不注入；0 禁用
@@ -151,7 +150,7 @@ git clone https://github.com/Fro2en12/dsh-persistent-memory
 lib/index.js    Host 半部分（ESM；inject tools/commands/settings，webServer 惰性）
   ├─ Config（schemastery）      30 个可调参数（含 dataDir/defaultScope 两个部署参数）、加载期校验
   ├─ 写侧闸门                   前缀白名单 / ≤240 字 / tags ≤3 / 凭据检测 / 冲突警告
-  ├─ pre-step 管线              守则 → 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底（四通道共享会话级注入预算 injectionBudgetChars，按此优先级串行分配）
+  ├─ pre-step 管线              守则（固定注入、不计预算）→ 教训通道 → RRF+词法召回 → LLM 重排 → 索引兜底（后三者共享会话级注入预算 injectionBudgetChars，按此优先级串行分配）
   ├─ RRF 混合召回               bigram-Jaccard 中文二元组 + 词法双排名倒数融合（K=60）
   ├─ 工具注册                   defineTool × 8 + /memory 命令
   ├─ /_dsh/dsh-persistent-memory/settings  面板 RPC（GET 快照 / POST 保存，localhost-only）
@@ -170,7 +169,7 @@ lib/client.js   Client 半部分（AMD bundle；window.__ModuleLoader__ 协议�
 | LLM 重排 | 候选 ≥1 就调用一次，5s 超时+失败降级词法，宁少勿多 |
 | 教训通道 | 悔恨/场景信号强制召回 rule.*/lesson.*，独立 120s 冷却，不受 once 限制 |
 | 索引配额 | global 4 条（user.* 固定 2 席），工作区 scope 各 3 条 |
-| 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「守则+教训+召回+索引」共享；守则（静态文案）不受砍，剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
+| 注入总预算 | `injectionBudgetChars` 默认 1200：单轮「教训+召回+索引」共享；**守则不计入**（每会话固定注入完整版约 3050 字），剩余预算不足时依次挤掉教训/召回/索引；单通道 `autoRecallBudgetChars` 300 与剩余总预算取小 |
 | scope 归一 | `normalizeScope` 只做 trim + 小写（M8）；报告建议的「_`/`空格折叠为 `-`」**有意未做**——避免改写用户已有的 scope 命名（如 `my project`），README 与源码注释均记录该决策 |
 | 写侧闸门 | value ≤240 字、tags ≤3、前缀白名单九类 |
 | 写入容量 | `maxItems` 默认 2000：达上限拒绝新增（更新不受限），提示跑 `memory_dream`；`/memory restore` 救援通道不受限 |

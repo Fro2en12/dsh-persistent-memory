@@ -132,9 +132,20 @@ export interface UpsertInput {
 export interface UpsertResult {
   created: boolean
   mergedKey: string
+  /** T17：内容是否真的变化。false = 空操作（同 scope+key 且 value/full/links/tags/source 与旧值全等） */
+  changed: boolean
+  /** T17：实际生效的 updatedAt——空操作时不刷新，原样返回旧值 */
+  updatedAt: string
   /** 内容高度相似（≥55%）但未合并的已有条目 key（供警告） */
   clashKey?: string
   clashSim?: number
+}
+
+/** T17：字符串数组按值比较（undefined 与空数组等价）；用于判定 upsert 是否为空操作 */
+function sameStringArray(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  const x = a ?? []
+  const y = b ?? []
+  return x.length === y.length && x.every((v, i) => v === y[i])
 }
 
 /** 写入/更新的合并逻辑：同 scope+key 覆盖更新；dedupe 时高相似 key 就地合并；否则 push 新建 */
@@ -158,15 +169,22 @@ export function upsertMemory(items: MemoryItem[], input: UpsertInput, opts: { de
   }
   if (idx >= 0) {
     const prev = items[idx]
-    items[idx] = {
-      ...prev,
-      value,
-      full: full !== undefined ? full : prev.full,
-      links: links.length ? links : prev.links,
-      tags: tags.length ? tags : prev.tags,
-      updatedAt,
-      source: explicitSource ? source : prev.source,
-    }
+    const nextFull = full !== undefined ? full : prev.full
+    const nextLinks = links.length ? links : prev.links
+    const nextTags = tags.length ? tags : prev.tags
+    const nextSource = explicitSource ? source : prev.source
+    // T17（第六轮）：空操作防护。updatedAt 被召回排序（recall.ts）、年龄标签与
+    // memory_dream 的过期判定（index.ts 的 ageDaysOf 分支）消费；无条件刷新会让反复
+    // 重申的旧记忆永远显得新鲜，代谢判定随之失效。内容全等时不动条目、不刷新时间，
+    // 由调用方据此跳过整次落盘。
+    const changed =
+      prev.value !== value
+      || prev.full !== nextFull
+      || !sameStringArray(prev.links, nextLinks)
+      || !sameStringArray(prev.tags, nextTags)
+      || prev.source !== nextSource
+    if (!changed) return { created: false, mergedKey, changed: false, updatedAt: prev.updatedAt }
+    items[idx] = { ...prev, value, full: nextFull, links: nextLinks, tags: nextTags, updatedAt, source: nextSource }
   } else {
     // v0.1.9 内容冲突检测：同 scope 已有内容高度相似的条目 → 警告提示确认，不静默并存
     const clash = items
@@ -185,5 +203,5 @@ export function upsertMemory(items: MemoryItem[], input: UpsertInput, opts: { de
     items.push({ id: opts.makeId(), key, value, full, links: links.length ? links : undefined, scope, tags, createdAt, updatedAt, source })
     created = true
   }
-  return { created, mergedKey, ...(clashKey !== undefined ? { clashKey, clashSim } : {}) }
+  return { created, mergedKey, changed: true, updatedAt, ...(clashKey !== undefined ? { clashKey, clashSim } : {}) }
 }

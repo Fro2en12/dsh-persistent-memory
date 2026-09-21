@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { apply } from '../src/index'
 import { cleanTempDir, findPluginMessages, makeFakeCtx, makeTempDir, runPreStep } from './helpers'
 
-// M11：会话级总注入预算（守则/教训/召回/索引串行分配）+ 守则默认 brief
+// M11：会话级总注入预算（教训/召回/索引串行分配；第六轮起守则不计入）+ 守则只保留完整版
 
 const tmpDirs: string[] = []
 afterEach(() => {
@@ -48,26 +48,36 @@ function pluginTextLength(decision: any): number {
     .reduce((n: number, m: any) => n + (m.content?.[0]?.text?.length ?? 0), 0)
 }
 
+/** 除守则外的注入长度（教训+召回+索引）。
+ *  第六轮起守则不再计入 injectionBudgetChars——它是每会话固定成本，
+ *  占额度只会让大守则静默挤掉记忆通道（实测 3049 字守则曾把 1200 预算吃成负数）。 */
+function memoryTextLength(decision: any): number {
+  return (decision?.messages ?? [])
+    .filter((m: any) => m?.source?.kind === 'plugin'
+      && m?.source?.plugin === '@dsh-external/dsh-persistent-memory'
+      && m?.source?.form !== 'memory-capture-guide'
+      && m?.source?.form !== 'memory-capture-guide-subagent')
+    .reduce((n: number, m: any) => n + (m.content?.[0]?.text?.length ?? 0), 0)
+}
+
 describe('M11 会话级总注入预算', () => {
-  it('守则+教训+召回同轮命中时，plugin 消息总长 ≤ injectionBudgetChars', async () => {
+  it('守则不计预算：同轮命中教训/召回时，记忆通道总长 ≤ injectionBudgetChars', async () => {
     const { fake } = setup({ injectionBudgetChars: 500 }, seedItems())
     const d = await runPreStep(fake.handlers, payload('sess-b1', '又错了，powershell 路径还是不对，node 版本也看下'))
     const forms = (d?.messages ?? []).filter((m: any) => m?.source?.plugin === '@dsh-external/dsh-persistent-memory').map((m: any) => m.source.form)
     expect(forms).toContain('memory-capture-guide')
-    expect(pluginTextLength(d)).toBeLessThanOrEqual(500)
+    expect(memoryTextLength(d)).toBeLessThanOrEqual(500)
   })
 
-  it('预算紧张时优先级：守则 > 教训 > 召回', async () => {
-    // 守则是静态文案（brief 约 350 字），优先级最高、永不被预算砍；
-    // 剩余预算不足时教训/召回被挤掉，而不是反过来砍守则。
-    const { fake } = setup({ injectionBudgetChars: 300, autoCaptureDetail: 'brief' }, seedItems())
+  it('预算紧张时守则照常注入，记忆通道按剩余额度裁剪', async () => {
+    // 守则每会话固定注入、不受预算约束（第六轮起也不占额度）；
+    // injectionBudgetChars 只约束教训/召回/索引。
+    const { fake } = setup({ injectionBudgetChars: 300 }, seedItems())
     const d = await runPreStep(fake.handlers, payload('sess-b2', '又错了，powershell 路径还是不对，node 版本也看下'))
     const guide = findPluginMessages(d, 'memory-capture-guide')[0]
     expect(guide).toBeTruthy()
-    const guideLen = guide.content[0].text.length
-    expect(pluginTextLength(d)).toBe(guideLen)   // 预算不足 → 除守则外没有任何额外注入
-    expect(findPluginMessages(d, 'memory-recall')).toHaveLength(0)
-    expect(findPluginMessages(d, 'memory-lesson')).toHaveLength(0)
+    expect(guide.content[0].text.length).toBeGreaterThan(1500)   // 完整守则
+    expect(memoryTextLength(d)).toBeLessThanOrEqual(300)
   })
 
   it('默认预算 1200 时不会无故砍掉单条召回', async () => {
@@ -75,25 +85,61 @@ describe('M11 会话级总注入预算', () => {
     const d = await runPreStep(fake.handlers, payload('sess-b3', 'env.node-version'))   // key 直中（首轮阈值 6 需要 key 命中）
     const recall = findPluginMessages(d, 'memory-recall')
     expect(recall.length).toBeGreaterThanOrEqual(1)
-    expect(pluginTextLength(d)).toBeLessThanOrEqual(1200)
+    expect(memoryTextLength(d)).toBeLessThanOrEqual(1200)
   })
 })
 
-describe('M11 守则默认 brief', () => {
-  it('默认配置注入精简守则（<600 字）', async () => {
-    const { fake } = setup({}, [])
-    const d = await runPreStep(fake.handlers, payload('sess-g1', '你好'))
-    const guide = findPluginMessages(d, 'memory-capture-guide')[0]
-    const text = guide.content[0].text as string
-    expect(text.length).toBeLessThan(600)
-    expect(text).toContain('记忆守则')
+// ── M11 收口（第六轮）：包装开销必须计入预算 ──────────────────────────
+// 修复前 fitBudget 用估算 used（value+key+64）扣减，不含通道标题与行前缀等包装：
+// 当时实测「守则 265 + 教训 192 + 索引 91 = 548 > 预算 500」，索引据虚高余额挤入。
+// 本轮起守则移出预算体系，下面的断言只针对记忆通道。
+describe('M11 收口：真实渲染长度计入会话级预算', () => {
+  it('预算取下限 300：教训按真实渲染长度吃满额度，91 字的索引被正确拒绝', async () => {
+    // 注：injectionBudgetChars 下限为 300（Math.max(300, …)），传更小的值会被静默提升。
+    const { fake } = setup({ injectionBudgetChars: 300 }, seedItems())
+    const d = await runPreStep(fake.handlers, payload('sess-f1', '又错了，powershell 路径还是不对，node 版本也看下'))
+    expect(memoryTextLength(d)).toBeLessThanOrEqual(300)
+    expect(findPluginMessages(d, 'memory-lesson').length).toBeGreaterThan(0)   // 教训（255 字）进得来
+    expect(findPluginMessages(d, 'memory-index')).toHaveLength(0)              // 索引（91 字）装不下剩余 45
   })
 
-  it('显式 autoCaptureDetail=full 时注入完整守则（>1500 字）', async () => {
-    const { fake } = setup({ autoCaptureDetail: 'full' }, [])
+  it('多档预算扫描：除守则自身外，注入总长不越界', async () => {
+    for (const b of [300, 400, 500, 600, 800, 1200]) {
+      const { fake } = setup({ injectionBudgetChars: b }, seedItems())
+      const d = await runPreStep(fake.handlers, payload('sess-scan-' + b, '又错了，powershell 路径还是不对，node 版本也看下'))
+      // 守则不计入预算，因此断言的是记忆通道总长 ≤ 预算——
+      // 守则再长也不会挤压记忆（这正是本轮修掉的耦合）。
+      const memLen = memoryTextLength(d)
+      expect(memLen, 'budget=' + b).toBeLessThanOrEqual(b)
+      // 反向断言：预算 ≥300 时记忆通道必须真的注入了东西，
+      // 否则「0 ≤ b」会让耦合回归时静默通过。
+      expect(memLen, 'budget=' + b + ' 应有注入').toBeGreaterThan(0)
+    }
+  })
+
+  it('对照组：预算充足且无召回命中时，索引照常注入（证明不是一律不注）', async () => {
+    const { fake } = setup({ injectionBudgetChars: 1200 }, seedItems())
+    const d = await runPreStep(fake.handlers, payload('sess-f2', '你好'))
+    expect(memoryTextLength(d)).toBeLessThanOrEqual(1200)
+    expect(findPluginMessages(d, 'memory-index').length).toBeGreaterThan(0)
+  })
+})
+
+describe('守则：只保留完整版（第六轮删除 brief）', () => {
+  it('默认即注入完整守则（>1500 字）', async () => {
+    const { fake } = setup({}, [])
+    const d = await runPreStep(fake.handlers, payload('sess-g1', '你好'))
+    const text = findPluginMessages(d, 'memory-capture-guide')[0].content[0].text as string
+    expect(text.length).toBeGreaterThan(1500)
+    expect(text).toContain('记忆使用守则')
+    // 空库 → 除守则外无任何注入，总长即守则长度
+    expect(pluginTextLength(d)).toBe(text.length)
+  })
+
+  it('已删除的 autoCaptureDetail 不再影响行为（传 brief 仍注入完整版，且不报错）', async () => {
+    const { fake } = setup({ autoCaptureDetail: 'brief' }, [])
     const d = await runPreStep(fake.handlers, payload('sess-g2', '你好'))
-    const guide = findPluginMessages(d, 'memory-capture-guide')[0]
-    const text = guide.content[0].text as string
+    const text = findPluginMessages(d, 'memory-capture-guide')[0].content[0].text as string
     expect(text.length).toBeGreaterThan(1500)
     expect(text).toContain('记忆使用守则')
   })
