@@ -78,7 +78,8 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
         // （不参与 changed 比较），新建条目仍由 upsertMemory 的 push 分支写入 '轮末提取'。
         explicitSource: false,
       }, { dedupe: true, makeId })
-      // M12 容量守卫（第七轮补）：与 memory_set:1365 同口径——只挡「新增」，更新已有 key 不受限。
+      // M12 容量守卫（第七轮补）：与 commitMemory 里 memory_set 的同一守卫同口径（见 write-ops.ts）——
+      // 只挡「新增」，更新已有 key 不受限。原先这里写的是「与 memory_set:1365 同口径」，行号已随拆分失效。
       // 修复前提取器完全不看 maxItems，只受 EXTRACT_LIBRARY_SOFT_CAP 软上限约束，且 rule/lesson
       // 可穿透软上限，无人值守路径能把库推到硬上限之上。
       if (result.created && items.length > maxItems) {

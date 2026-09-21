@@ -2,7 +2,8 @@
  * pre-step 注入四通道（第 2 批拆分；原 index.ts apply() 闭包）。
  *
  * 通道顺序：守则（每会话首轮一次）→ 教训/规则 → 召回（词法 + RRF + 可选 LLM 重排）→ 索引兜底，
- * 共享会话级总预算 injectionBudgetChars；守则不计入预算（它永不被砍）。
+ * 共享**每轮**总预算 injectionBudgetChars（每次 pre-step 重新起算，不是会话级累计）；
+ * 守则不计入预算（它永不被砍）。
  *
  * deps 化说明：原先这些函数闭包在 apply() 上（scoreEnv/recallEnv、rerankMemories、
  * isOwnInjected/AUTO_CAPTURE_FORM/sessionQueryAvailable/buildGuideText 与 pre-step 监听器）。
@@ -169,7 +170,9 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
           })
         }
 
-        // M11：会话级总预算——教训 > 召回 > 索引 串行分配。
+        // M11：每轮总预算（每次 pre-step 重新起算）——教训 > 召回 > 索引 串行分配。
+        // 复审实测：同一会话连跑 3 个 step 可累计注入 675 字 > 300 的额度，因为额度是每轮重置的；
+        // 只有教训通道的 120s 冷却在跨轮限流。
         // 第六轮：守则**不再计入预算**。它本来就「永不被砍」，占额度只会让大守则静默挤掉
         // 记忆通道（实测 full 守则 3049 > 默认预算 1200 时，教训/召回/索引全部归零）。
         // 语义：injectionBudgetChars 是「给具体记忆的额度」，守则是每会话固定成本。

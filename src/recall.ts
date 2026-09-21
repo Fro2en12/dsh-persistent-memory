@@ -289,7 +289,8 @@ export function fitBudget(
 ): { kept: MemoryItem[]; used: number } {
   const kept: MemoryItem[] = []
   let used = 0
-  // M11：会话级总预算耗尽（<=0）时直接返回空
+  // M11：本通道可用额度耗尽（<=0）时直接返回空——注意传进来的 budget 是调用方按
+  // 「min(单通道预算, 本轮剩余预算)」算好的；预算每轮 pre-step 重置，不是会话级。
   if (budget <= 0) return { kept, used }
   for (const item of items) {
     const cost = Math.min(sanitize(item.value).length, maxChars) + item.key.length + 64

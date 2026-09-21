@@ -193,3 +193,13 @@ describe('S5 新增凭据形态的掩码', () => {
     }
   })
 })
+
+// ── 复审对齐：掩码文案不得承诺一条默认走不通的取回路径 ──────────────────────
+describe('复审 掩码文案与实现一致', () => {
+  it('不得声称「confirmed:true 可取回原文」（默认 allowCredentialReveal=false 时无效）', () => {
+    const t = maskCredential('sk-1234567890abcdef')
+    expect(t).toContain('掩码')
+    expect(t, '默认配置下 confirmed 无效，文案不能承诺可取回').not.toContain('可取回')
+    expect(maskCredential('普通的口令文本')).not.toContain('可取回')
+  })
+})

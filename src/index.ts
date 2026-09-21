@@ -155,7 +155,7 @@ export function apply(ctx: Context, config: Config): void {
   // v0.1.20：600 → 300。单条成本 ≈ 截断后正文 + key + 固定包装 ≈ 200 字，
   // 300 的预算意味着实际多为 1 条、偶尔 2 条——自动注入只负责"提个醒"，取全用 memory_search。
   const autoRecallBudgetChars = Math.max(120, config.autoRecallBudgetChars || 300)
-  // M11 会话级总预算（v0.1.23）：修复前四通道各有独立预算、守则与索引完全不受约束，
+  // M11 每轮总预算（v0.1.23）：修复前四通道各有独立预算、守则与索引完全不受约束，
   // 最坏单轮 ≈ 守则 3000 + 教训 300 + 召回 300 + 索引 160，而用户以为旋钮是 300。
   const injectionBudgetChars = Math.max(300, config.injectionBudgetChars || 1200)
   // 召回阈值（v0.1.17）：绝对下限挡"整体都不相关"，相对比例挡"矮子里拔将军"。

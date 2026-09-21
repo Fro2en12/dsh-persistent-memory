@@ -47,7 +47,7 @@ English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic re
 | 机制 | 说明 |
 |---|---|
 | 九类记忆分类学 | 每会话首轮注入「自动记忆守则」（约 3070 字；第六轮起不再提供精简版，每会话只注入完整守则）：user（画像）/ rule（纠正+成功确认，Why/How to apply 结构）/ task（绝对日期）/ project（定稿结论）/ env（环境指针）/ tool（坑）/ ref（资源指针）/ auth（凭据，显式要求才记）/ lesson（负面知识账本）。判据含「不记清单」：代码可推导内容、git 史、完整修复配方、AGENTS.md/cairn 已有内容 |
-| 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀检测到明文密码直接拒绝；task.* 缺绝对日期、含 token 类关键词只警告 |
+| 写侧硬闸门 | `memory_set` 硬校验：key 前缀白名单、value ≤240 字（细节挪 full）、tags ≤3 个、非 auth.* 前缀命中凭据判据即**直接拒绝**——判据含**裸关键词**（`token`/`secret`/`api key`/`access key`/`AccountKey`/`password`/`passwd`/`密码`/`口令`/`密钥`；ASCII 词按词边界匹配，故 `passwordless`、`tokenizer` 不算）、厂商前缀、JWT、带账号密码的连接串、PRIVATE KEY 与高熵令牌串。裸关键词「出现即算」是**有意的 fail-closed**，所以「每轮注入预算按 token 计」这类正常经验也会被拒——**逃生路径**：改写措辞（如「上下文预算」），或确认确为凭据时用 `auth.*` 前缀。task.* 缺绝对日期只**警告** |
 | 自动召回 | pre-step 词法评分（同义词展开+噪音词过滤+首轮阈值 6）；词法 0 命中时 **RRF 混合召回**（词法+中文二元组双排名倒数融合，零 token 零依赖）按语义补位 |
 | LLM 语义重排 | 候选 ≥1 时用当前路由模型从 RRF 候选池挑「明确有用」的 ≤5 条（宁少勿多；正用工具的参考文档不选，警告/坑照选）；LLM 不可用/失败/5s 超时自动降级词法 |
 | 教训通道 | 悔恨信号（「又错/还是失败」）或场景信号（路径/盘符/终端/命令）时**不受每会话一次限制**强制召回 rule.*/lesson.*，独立 120s 冷却——错误发生时把上次的坑摆到眼前。同一条在本会话历史里出现过就不再注入（v0.1.20 修 marker 格式，此前去重形同虚设） |

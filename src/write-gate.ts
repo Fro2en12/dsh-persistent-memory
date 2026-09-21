@@ -92,8 +92,12 @@ export function findCredentialMatch(body: string): string | null {
  */
 export function maskCredential(text: string): string {
   const m = text.match(/(sk-ant-|sk-proj-|sk_live_|sk_test_|github_pat_|glpat-|xox[abposr]-|npm_|sk-|ghp_|AKIA|ASIA|Bearer\s+|Basic\s+)/i)
-  if (m) return `${m[1]}****（凭据已掩码，memory_get 带 confirmed:true 可取回原文）`
-  return '****（凭据类记忆已掩码，memory_get 带 confirmed:true 可取回原文）'
+  // F7/R3（复审对齐）：这里原先写「memory_get 带 confirmed:true 可取回原文」——但默认配置
+  // allowCredentialReveal=false 时那条路走不通（memory_get 的 reveal = allowCredentialReveal && confirmed），
+  // 于是这句话会把模型引向一次必然无效的重试。本函数拿不到该配置，故只说事实；
+  // 「怎么才能取回」由调用方（memory_get 的 render）按配置补全。
+  if (m) return `${m[1]}****（凭据已掩码：默认不返回原文）`
+  return '****（凭据类记忆已掩码：默认不返回原文）'
 }
 
 /**
