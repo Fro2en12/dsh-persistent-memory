@@ -8,6 +8,7 @@
  * 的参数求值位置逐字对应（红队 P2 收口）。
  */
 import { lexicalHit, rrfRanking, semanticOverlap, type ScoreEnv } from './recall.js'
+import { isPluginInjectedKind } from './const.js'
 import type { MemoryItem } from './types.js'
 
 
@@ -27,7 +28,7 @@ export function extractQuery(messages: unknown[]): { query: string; hasImage: bo
     }
     if (!msg || !Array.isArray(msg.content)) continue
     // 跳过插件注入消息（自动守则/召回/教训），避免其文本污染查询信号
-    if (msg.source?.kind === 'plugin') continue
+    if (isPluginInjectedKind(msg.source?.kind)) continue
     const blocks = msg.content
     if (blocks.some((b) => b?.type === 'image' || b?.type === 'image_url')) hasImage = true
     const t = blocks

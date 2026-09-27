@@ -11,6 +11,6 @@
  * 只是闭包对象从 apply() 作用域换成 deps 解构出的同名局部绑定。
  * sessionInjections / runtime / 各 Map 都是引用传递，与 index.ts 共用同一实例。
  */
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 import type { MemoryDeps } from './deps.js';
 export declare function registerPreStep(ctx: Context, deps: MemoryDeps): void;

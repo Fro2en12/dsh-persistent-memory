@@ -1,4 +1,4 @@
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 import type { MemoryDeps } from './deps.js';
 export declare function buildPanelHtml(items: {
     scope: string;

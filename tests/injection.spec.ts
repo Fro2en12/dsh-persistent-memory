@@ -118,3 +118,43 @@ describe('C4 工具输出面清洗', () => {
     expect(html).toContain('[已过滤可疑指令文本]')
   })
 })
+
+// v0.1.32：注入消息的 source 适配 DSH 会话格式 v4 的 producer kind。
+// v3 的 { kind: 'plugin', plugin } 包装被 v4 拒绝（SessionFormatError: format v4 message
+// requires a producer-owned source kind），而 v3→v4 迁移边对第三方插件的产出是 plugin:<插件名>。
+describe('v4 会话格式：注入消息的 source kind', () => {
+  function payload(sid: string) {
+    return {
+      agent: { session: { id: sid, header: {}, surface: undefined, events: undefined }, options: {} },
+      messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }],
+      step: 1,
+      signal: undefined,
+    }
+  }
+
+  it('注入消息用 producer kind，不再带 v3 的 plugin 字段', async () => {
+    const { fake } = setup()
+    const d = await runPreStep(fake.handlers, payload('sess-v4-kind'))
+    const injected = (d?.messages ?? []).filter((m: any) => m?.source?.form === 'memory-capture-guide')
+    expect(injected).toHaveLength(1)
+    const src = injected[0].source
+    expect(src.kind).toBe('plugin:@dsh-external/dsh-persistent-memory')
+    expect(src.kind).not.toBe('plugin')
+    expect(Object.hasOwn(src, 'plugin')).toBe(false)
+  })
+
+  it('历史里的 v3 形状仍认作已注入，不重复注入守则', async () => {
+    const { fake } = setup()
+    const preStep = fake.handlers.get('agent/pre-step')?.[0]
+    const prior = {
+      role: 'user',
+      id: 'prior-v3',
+      content: [{ type: 'text', text: '旧的守则注入' }],
+      source: { kind: 'plugin', plugin: '@dsh-external/dsh-persistent-memory', form: 'memory-capture-guide' },
+    }
+    const d = await preStep(payload('sess-v3-kind'), async () => ({ kind: 'enter', messages: [prior] }))
+    const guides = (d?.messages ?? []).filter((m: any) => m?.source?.form === 'memory-capture-guide')
+    expect(guides).toHaveLength(1)
+    expect(guides[0].id).toBe('prior-v3')
+  })
+})

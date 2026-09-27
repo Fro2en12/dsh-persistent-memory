@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-persistent-memory",
-  "version": "0.1.31",
+  "version": "0.1.32",
   "description": "DSH 持久记忆插件：跨会话保存/检索用户偏好、项目事实与任务状态，数据落盘 JSONL。",
   "private": true,
   "type": "module",
@@ -35,7 +35,7 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
     "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
-    "cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
     "schemastery": "^3.18.0",
     "@deepseek-ai/dsh-subagent": ">=0.0.1-rc <2"
   },

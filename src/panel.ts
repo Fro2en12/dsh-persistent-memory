@@ -10,7 +10,7 @@
  */
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { MemoryDeps } from './deps.js'
 

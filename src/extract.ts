@@ -9,13 +9,13 @@
  * turnBuffers / lastExtractAt / lastManualWriteAt / extractingSessions 是引用传递，
  * extractCounters 必须整体传引用（解构成 number 会让全局并发上限失效）。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { EXTRACTION_SYSTEM_PROMPT } from './prompts.js'
 import { KEY_PREFIX_WHITELIST } from './types.js'
 import { findCredentialMatch, upsertMemory } from './write-gate.js'
 import { withConflictRetry } from './store.js'
 import { bigramJaccard, keySimilarity, truncate } from './recall.js'
-import { PLUGIN_NAME } from './const.js'
+import { PLUGIN_SOURCE_KIND } from './const.js'
 import type { MemoryDeps } from './deps.js'
 
 export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
@@ -124,7 +124,7 @@ export function registerExtraction(ctx: Context, deps: MemoryDeps): void {
           id: `mid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
           role: 'user',
           content: [{ type: 'text', text: `对话摘录：\n${dialogue}` }],
-          source: { kind: 'plugin', plugin: PLUGIN_NAME },
+          source: { kind: PLUGIN_SOURCE_KIND },
         }],
       })
       for await (const chunk of stream) {

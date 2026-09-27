@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { isOwnSource } from '../src/const'
 
 export interface FakeSettingsService {
   register(ns: string, schema: unknown, opts?: { base?: Record<string, unknown>; applies?: string }): { get(): Record<string, unknown>; watch(fn: (next: Record<string, unknown>) => void): void }
@@ -140,7 +141,7 @@ export async function runPreStep(handlers: Map<string, any[]>, payload: any): Pr
 }
 
 export function findPluginMessages(decision: any, form: string): any[] {
-  return (decision?.messages ?? []).filter((m: any) => m?.source?.kind === 'plugin' && m?.source?.form === form)
+  return (decision?.messages ?? []).filter((m: any) => isOwnSource(m?.source) && m?.source?.form === form)
 }
 
 export function ensureNoFile(dir: string): void {

@@ -8,7 +8,7 @@
  * 依赖形态：registerTools(ctx, deps, writeOps)；writeOps 与 commands 共用同一实例
  * （createWriteOps 在 apply() 内只构造一次）。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { MemoryItem } from './types.js'
 import { escapeMemoryAttr, neutralizeMemoryDataDelimiters, sanitizeValue } from './sanitize.js'

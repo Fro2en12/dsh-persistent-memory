@@ -9,7 +9,7 @@
  * 面板 HTML 复用 panel.buildPanelHtml。
  */
 import { promises as fs } from 'node:fs'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { dirname, isAbsolute, join } from 'node:path'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { MemoryItem } from './types.js'

@@ -9,6 +9,6 @@
  * turnBuffers / lastExtractAt / lastManualWriteAt / extractingSessions 是引用传递，
  * extractCounters 必须整体传引用（解构成 number 会让全局并发上限失效）。
  */
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 import type { MemoryDeps } from './deps.js';
 export declare function registerExtraction(ctx: Context, deps: MemoryDeps): void;

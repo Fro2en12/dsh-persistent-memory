@@ -11,13 +11,13 @@
  * 只是闭包对象从 apply() 作用域换成 deps 解构出的同名局部绑定。
  * sessionInjections / runtime / 各 Map 都是引用传递，与 index.ts 共用同一实例。
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { buildAutoCaptureText, RERANK_SYSTEM_PROMPT, SUBAGENT_CAPTURE_TEXT } from './prompts.js'
 import { buildIndexBlock, buildRerankManifest, excludeCredentials, formatLesson, formatRecall } from './format.js'
 import type { MemoryItem } from './types.js'
 import { sanitizeValue } from './sanitize.js'
 import { fitBudget, fitByRenderedLength, pickRecallItems, type RecallEnv, type ScoreEnv } from './recall.js'
-import { PLUGIN_NAME } from './const.js'
+import { PLUGIN_SOURCE_KIND, isOwnSource } from './const.js'
 import { extractQuery, pickLessonItems, pickRecallCandidates, regretSignal, ruleScene } from './query.js'
 import type { MemoryDeps } from './deps.js'
 
@@ -82,7 +82,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
           id: `mid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
           role: 'user',
           content: [{ type: 'text', text: content }],
-          source: { kind: 'plugin', plugin: PLUGIN_NAME },
+          source: { kind: PLUGIN_SOURCE_KIND },
         }],
       })
       for await (const chunk of stream) {
@@ -108,13 +108,9 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
   // 注入去重（v0.1.19 起为 form 级）：会话历史里已有同 form 的注入即视为已注入，
   // 不再比对正文——否则守则/召回文本一改（如精简守则上线）就会在同一会话再追加一份。
   function isOwnInjected(message: unknown, form: string): boolean {
-    const msg = message as { source?: { kind?: string; plugin?: string; form?: string } }
-    return Boolean(
-      msg
-      && msg.source?.kind === 'plugin'
-      && msg.source.plugin === PLUGIN_NAME
-      && msg.source.form === form,
-    )
+    const msg = message as { source?: { kind?: unknown; plugin?: unknown; form?: string } } | null | undefined
+    if (!msg || msg.source?.form !== form) return false
+    return isOwnSource(msg.source)
   }
 
   // ── 自动记忆守则 + 自动召回 ────────────────────────────────────────────
@@ -188,7 +184,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
               role: 'user',
               id: makeId(),
               content: [{ type: 'text', text: guideText }],
-              source: { kind: 'plugin', plugin: PLUGIN_NAME, form: guideForm, summary: '记忆守则自动注入' },
+              source: { kind: PLUGIN_SOURCE_KIND, form: guideForm, summary: '记忆守则自动注入' },
             })
             // 有界淘汰（T4 修）：统一走 setBounded（先 set 再 while(size>max) 删最旧）——
             // 旧写法「先判 size>200 再 set」的稳态是 201 条，上界失效 1 条
@@ -235,7 +231,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
                 role: 'user',
                 id: makeId(),
                 content: [{ type: 'text', text }],
-                source: { kind: 'plugin', plugin: PLUGIN_NAME, form: 'memory-lesson', summary: `教训/规则提醒 ${lessonKept.length} 条` },
+                source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lesson', summary: `教训/规则提醒 ${lessonKept.length} 条` },
               })
               setBounded(sessionInjections, lessonKey, Date.now())
               persistInjectionState()
@@ -300,7 +296,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
                     role: 'user',
                     id: makeId(),
                     content: [{ type: 'text', text }],
-                    source: { kind: 'plugin', plugin: PLUGIN_NAME, form: 'memory-recall', summary: `记忆自动召回 ${recalledItems.length} 条` },
+                    source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-recall', summary: `记忆自动召回 ${recalledItems.length} 条` },
                   })
                   setBounded(sessionInjections, sid, Date.now())
                   persistInjectionState()
@@ -326,7 +322,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
                 role: 'user',
                 id: makeId(),
                 content: [{ type: 'text', text }],
-                source: { kind: 'plugin', plugin: PLUGIN_NAME, form: 'memory-index', summary: '记忆索引（未召回）' },
+                source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-index', summary: '记忆索引（未召回）' },
               })
               setBounded(sessionInjections, idxKey, Date.now())
               // v0.1.20 互斥：索引块与召回共用会话主键——首轮给过目录就不再补一次
@@ -357,7 +353,7 @@ export function registerPreStep(ctx: Context, deps: MemoryDeps): void {
                 role: 'user',
                 id: makeId(),
                 content: [{ type: 'text', text: guideText }],
-                source: { kind: 'plugin', plugin: PLUGIN_NAME, form: guideForm, summary: '记忆守则自动注入' },
+                source: { kind: PLUGIN_SOURCE_KIND, form: guideForm, summary: '记忆守则自动注入' },
               })
               // R2（复审）：与其余 5 处一致走 setBounded——裸 set 绕过 T4 的 max=200 上界
               setBounded(sessionInjections, guideKey, Date.now())

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { writeFileSync as writeFs } from 'node:fs'
 import { join } from 'node:path'
 import { apply, Config } from '../src/index'
+import { isOwnSource } from '../src/const'
 import { cleanTempDir, findPluginMessages, makeFakeCtx, makeTempDir, runPreStep } from './helpers'
 
 // M11：会话级总注入预算（教训/召回/索引串行分配；第六轮起守则不计入）+ 守则只保留完整版
@@ -44,7 +45,7 @@ function payload(sid: string, text: string) {
 
 function pluginTextLength(decision: any): number {
   return (decision?.messages ?? [])
-    .filter((m: any) => m?.source?.kind === 'plugin' && m?.source?.plugin === '@dsh-external/dsh-persistent-memory')
+    .filter((m: any) => isOwnSource(m?.source))
     .reduce((n: number, m: any) => n + (m.content?.[0]?.text?.length ?? 0), 0)
 }
 
@@ -53,8 +54,7 @@ function pluginTextLength(decision: any): number {
  *  占额度只会让大守则静默挤掉记忆通道（实测 3049 字守则曾把 1200 预算吃成负数）。 */
 function memoryTextLength(decision: any): number {
   return (decision?.messages ?? [])
-    .filter((m: any) => m?.source?.kind === 'plugin'
-      && m?.source?.plugin === '@dsh-external/dsh-persistent-memory'
+    .filter((m: any) => isOwnSource(m?.source)
       && m?.source?.form !== 'memory-capture-guide'
       && m?.source?.form !== 'memory-capture-guide-subagent')
     .reduce((n: number, m: any) => n + (m.content?.[0]?.text?.length ?? 0), 0)
@@ -64,7 +64,7 @@ describe('M11 会话级总注入预算', () => {
   it('守则不计预算：同轮命中教训/召回时，记忆通道总长 ≤ injectionBudgetChars', async () => {
     const { fake } = setup({ injectionBudgetChars: 500 }, seedItems())
     const d = await runPreStep(fake.handlers, payload('sess-b1', '又错了，powershell 路径还是不对，node 版本也看下'))
-    const forms = (d?.messages ?? []).filter((m: any) => m?.source?.plugin === '@dsh-external/dsh-persistent-memory').map((m: any) => m.source.form)
+    const forms = (d?.messages ?? []).filter((m: any) => isOwnSource(m?.source)).map((m: any) => m.source.form)
     expect(forms).toContain('memory-capture-guide')
     expect(memoryTextLength(d)).toBeLessThanOrEqual(500)
   })

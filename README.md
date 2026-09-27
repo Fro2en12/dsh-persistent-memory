@@ -5,6 +5,8 @@
 English: A DeepSeek Harness (DSH) plugin for persistent memory with automatic recall. A nine-type memory taxonomy drives automatic capture guidance and a write-side gate; recall combines lexical scoring, zero-token RRF hybrid ranking, and LLM reranking; plus a lesson channel, memory metabolism, one-click import from Claude Code memory files, historical-session recall, and a settings panel.
 
 > **兼容性**：本版本对齐 DSH `0.1.2-alpha` —— 工具注册走官方 `defineTool`、设置面板走官方 `ctx.settings.register` + `settings.section` slot、会话检索走 `ctx.get('sessionQuery')` 接缝（可选，缺失时工具报错降级）。数据落盘 `$DSH_HOME/dsh-persistent-memory/memory.jsonl`（JSONL 存储，首行为 `{"__schema":1}` 哨兵，标记存储格式版本、供后续迁移识别），重启不丢。
+>
+> **0.1.32 起（对齐 DSH `0.1.7-rc.2` 的会话格式 v4）**：注入消息的 `source.kind` 从 v3 的 `{ kind: 'plugin', plugin: '<插件名>' }` 包装改为 v4 的 producer kind `plugin:@dsh-external/dsh-persistent-memory`。v4 拒绝裸 `kind: 'plugin'`（`format v4 message requires a producer-owned source kind`），而 v3→v4 迁移边对第三方插件产出的正是同一个值，新旧会话因此共用一种形状；读取侧（注入去重、查询提取）同时兼容两种形状。
 
 ## ⚠️ AI 产物声明
 
